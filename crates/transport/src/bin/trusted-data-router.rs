@@ -32,7 +32,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match args.first().map(String::as_str) {
         Some("relay") if args.len() == 5 => {
             // relay LISTEN DATABASE PUBLIC_KEY_PEM ISSUER
-            let verifier = Verifier::new(&std::fs::read(&args[3])?, args[4].clone())?;
+            let verifier = Verifier::from_file(Path::new(&args[3]).to_path_buf(), args[4].clone())?;
             let database = Path::new(&args[2]);
             let parent = database.parent().ok_or("missing private state directory")?;
             use std::os::unix::fs::PermissionsExt;

@@ -70,8 +70,27 @@ long read timeouts. TLS must cover both clients and nodes; the relay intentional
 refuses a non-loopback plaintext listener. No changes to the backend or Fleet's
 heartbeat proxy are needed. Relay and TLS proxy see plaintext application data;
 this is not TEE end-to-end confidentiality. This version serves one relay with a
-durable local database; an HA route directory and signing-key overlap are future
-work. Never run concurrent relay processes against the same database.
+durable local database; an HA route directory remains future work. Never run
+concurrent relay processes against the same database.
+
+The existing public-key PEM file can contain up to eight distinct Ed25519 public
+keys. The relay and `Verifier::from_file` reload it on each new admission. Gateways
+created from the existing environment also reload their signing-key and public-key
+files; embedders using `Gateway::new` can opt in with `with_key_files`. Invalid,
+missing, truncated or writable-by-others trust files reject new requests rather
+than retaining stale keys. Private files require 0600; public files may be 0644.
+Use atomic replacement, not an in-place write.
+
+For rotation, first distribute the old+new public PEM bundle to every gateway,
+relay and shim. Then replace the gateway signing key and reissue node enrollment
+credentials with the new key. Enrollment credentials can live for 30 days, so
+waiting for the one-hour maximum route-grant lifetime alone is insufficient.
+Once old enrollments are replaced and old route grants have expired, remove the
+old public key. Exact route IDs do not change, connector renewal uses the same
+connection, and admitted streams retain their original expiry and Fleet
+revocation checks. Removing a key blocks new admissions; it does not retroactively
+terminate previously admitted streams. Use Fleet route/subject revocation for
+immediate withdrawal of active access.
 
 The application's authenticated control gateway uses `grants::sign` after checking
 the principal's ownership and the current Fleet allocation. It must issue the

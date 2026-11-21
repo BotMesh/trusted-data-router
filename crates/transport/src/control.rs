@@ -10,7 +10,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -68,16 +68,7 @@ pub fn enroll_node(private_key: &[u8], credential: &NodeCredential) -> Result<St
 }
 
 pub fn private_file(path: &Path) -> Result<Vec<u8>> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::symlink_metadata(path).map_err(|_| Error::Unavailable)?;
-    if !path.is_absolute()
-        || !meta.is_file()
-        || meta.permissions().mode() & 0o077 != 0
-        || meta.len() > 16384
-    {
-        return Err(Error::InvalidContract);
-    }
-    std::fs::read(path).map_err(|_| Error::Unavailable)
+    crate::keys::read_file(path, true)
 }
 
 fn root(value: &str) -> Result<reqwest::Url> {
@@ -101,7 +92,8 @@ pub struct Gateway {
     relay: reqwest::Url,
     issuer: String,
     signing_key: Vec<u8>,
-    node_key: DecodingKey,
+    signing_key_file: Option<PathBuf>,
+    node_keys: crate::keys::VerificationKeys,
     registration_token_file: PathBuf,
     namespace_tokens: std::collections::HashMap<String, PathBuf>,
     client: reqwest::Client,
@@ -167,7 +159,7 @@ impl Gateway {
         if !label(&issuer) {
             return Err(Error::InvalidContract);
         }
-        let node_key = DecodingKey::from_ed_pem(public_key).map_err(|_| Error::InvalidContract)?;
+        let node_keys = crate::keys::VerificationKeys::new(public_key)?;
         // Reject mismatched key pairs at startup, rather than issuing unusable grants.
         let probe = NodeCredential {
             iss: issuer.clone(),
@@ -180,19 +172,54 @@ impl Gateway {
         let token = enroll_node(private_key, &probe)?;
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.set_audience(&[NODE_AUDIENCE]);
-        jsonwebtoken::decode::<NodeCredential>(&token, &node_key, &validation)
+        node_keys
+            .decode::<NodeCredential>(&token, &validation)
             .map_err(|_| Error::InvalidContract)?;
         Ok(Arc::new(Self {
             fleet: root(fleet_url)?,
             relay: root(relay_url)?,
             issuer,
             signing_key: private_key.into(),
-            node_key,
+            signing_key_file: None,
+            node_keys,
             registration_token_file,
             namespace_tokens: Default::default(),
             authorization_router: None,
             client: http_client(None)?,
         }))
+    }
+
+    /// Keep the existing paths live so an operator can stage overlapping public
+    /// keys and switch the signer without restarting embedded gateways.
+    pub fn with_key_files(
+        mut self: Arc<Self>,
+        private: PathBuf,
+        public: PathBuf,
+    ) -> Result<Arc<Self>> {
+        let gateway = Arc::make_mut(&mut self);
+        gateway.node_keys = crate::keys::VerificationKeys::file(public)?;
+        gateway.signing_key_file = Some(private);
+        gateway.checked_signing_key()?;
+        gateway.signing_key.clear();
+        Ok(self)
+    }
+
+    fn checked_signing_key(&self) -> Result<Vec<u8>> {
+        let key = match &self.signing_key_file {
+            Some(path) => private_file(path)?,
+            None => self.signing_key.clone(),
+        };
+        let probe = NodeCredential {
+            iss: self.issuer.clone(),
+            aud: NODE_AUDIENCE.into(),
+            sub: "key-check".into(),
+            namespaces: vec!["key-check".into()],
+            nbf: grants::now(),
+            exp: grants::now() + 60,
+        };
+        let token = enroll_node(&key, &probe)?;
+        self.node(&token)?;
+        Ok(key)
     }
 
     /// Optional central-backend integration, using its existing environment.
@@ -202,9 +229,10 @@ impl Gateway {
             return Ok(None);
         };
         let value = |name| std::env::var(name).map_err(|_| Error::InvalidContract);
-        let key = private_file(Path::new(&value("TRUSTED_GATEWAY_SIGNING_KEY_FILE")?))?;
-        let public = std::fs::read(value("TRUSTED_GATEWAY_PUBLIC_KEY_FILE")?)
-            .map_err(|_| Error::Unavailable)?;
+        let key_path = PathBuf::from(value("TRUSTED_GATEWAY_SIGNING_KEY_FILE")?);
+        let public_path = PathBuf::from(value("TRUSTED_GATEWAY_PUBLIC_KEY_FILE")?);
+        let key = private_file(&key_path)?;
+        let public = crate::keys::read_file(&public_path, false)?;
         let mut gateway = Self::new(
             &fleet,
             &value("TRUSTED_GATEWAY_RELAY_URL")?,
@@ -212,7 +240,8 @@ impl Gateway {
             &key,
             &public,
             value("TRUSTED_GATEWAY_FLEET_TOKEN_FILE")?.into(),
-        )?;
+        )?
+        .with_key_files(key_path, public_path)?;
         if let Some(ca) = ca_from_env("TRUSTED_GATEWAY_CA_FILE")? {
             Arc::make_mut(&mut gateway).client = http_client(Some(&ca))?;
         }
@@ -363,9 +392,7 @@ impl Gateway {
         validation.set_issuer(&[&self.issuer]);
         validation.leeway = 0;
         validation.validate_nbf = true;
-        let claims = jsonwebtoken::decode::<NodeCredential>(token, &self.node_key, &validation)
-            .map_err(|_| Error::Unauthorized)?
-            .claims;
+        let claims: NodeCredential = self.node_keys.decode(token, &validation)?;
         claims.validate()?;
         Ok(claims)
     }
@@ -573,7 +600,7 @@ impl Gateway {
                 service: grant.service.clone(),
                 base_url: format!("{}v1/http/{}", self.relay, route_id),
                 route_id,
-                token: grants::sign(&self.signing_key, &grant)?,
+                token: grants::sign(&self.checked_signing_key()?, &grant)?,
                 expires_at: grant.exp,
             });
         }
@@ -633,7 +660,7 @@ impl Gateway {
             return Err(Error::Unauthorized);
         }
         grants::sign(
-            &self.signing_key,
+            &self.checked_signing_key()?,
             &self.grant(
                 request.execution.clone(),
                 request.service.id.clone(),
