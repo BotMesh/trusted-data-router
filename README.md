@@ -160,3 +160,5 @@ cargo test --locked --workspace
 
 The local test creates ephemeral Ed25519 keys with `openssl`; no production
 credentials, remote cluster or local prover is used.
+
+The optional [central connection gateway](crates/transport/CONTROL.md) embeds in an application's backend and issues grants only after checking Fleet's live runtime discovery and caller scope. It uses the same transport crate; no second runtime catalog is introduced.

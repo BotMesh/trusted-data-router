@@ -84,12 +84,19 @@ impl Relay {
             .with_state(self)
     }
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> std::io::Result<()> {
+        self.serve_with_origins(listener, &[]).await
+    }
+    pub async fn serve_with_origins(
+        self: Arc<Self>,
+        listener: TcpListener,
+        origins: &[String],
+    ) -> std::io::Result<()> {
         if !listener.local_addr()?.ip().is_loopback() {
             return Err(std::io::Error::other(
                 "TLS proxy must reach a loopback listener",
             ));
         }
-        axum::serve(listener, self.router()).await
+        axum::serve(listener, browser_router(self.router(), origins)?).await
     }
     fn authenticate(
         &self,
@@ -140,6 +147,48 @@ impl Relay {
         }
         Ok(session.clone())
     }
+}
+
+/// Browser traffic carries its scoped grant in a header. Never enable wildcard
+/// origins or cookies on the relay; application ownership is checked centrally.
+pub fn browser_router(router: Router, origins: &[String]) -> std::io::Result<Router> {
+    use axum::http::{header, HeaderValue, Method};
+    use tower_http::cors::CorsLayer;
+    if origins.is_empty() {
+        return Ok(router);
+    }
+    let mut allowed = Vec::new();
+    for origin in origins {
+        let url = reqwest::Url::parse(origin).map_err(std::io::Error::other)?;
+        if url.origin().ascii_serialization() != *origin
+            || url.scheme() != "https"
+                && !(url.scheme() == "http"
+                    && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")))
+        {
+            return Err(std::io::Error::other("invalid browser origin"));
+        }
+        allowed.push(HeaderValue::from_str(origin).map_err(std::io::Error::other)?);
+    }
+    Ok(router.layer(
+        CorsLayer::new()
+            .allow_origin(allowed)
+            .allow_methods([
+                Method::GET,
+                Method::HEAD,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers([
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+                header::ACCEPT,
+                header::HeaderName::from_static("x-trusted-access"),
+            ])
+            .max_age(Duration::from_secs(300)),
+    ))
 }
 
 fn upgrade(
