@@ -101,6 +101,7 @@ async fn acceptance() {
         nbf: grants::now(),
         exp: grants::now() + 120,
         purpose: Purpose::Register,
+        http_request: None,
         execution: ExecutionIdentity {
             namespace: "film".into(),
             workload: "qwen".into(),
@@ -137,6 +138,24 @@ async fn acceptance() {
     let route = grant.route_id();
     let verifier = Verifier::new(&public, grant.iss.clone()).unwrap();
     assert!(verifier.verify(&register, Purpose::Access).is_err());
+    let mut bound = grant.clone();
+    bound.purpose = Purpose::Access;
+    bound.http_request = Some(trusted_router_transport::grants::HttpRequestBinding {
+        id: "ab".repeat(32),
+        method: "POST".into(),
+        path: "/echo".into(),
+        body_sha256: "cd".repeat(32),
+    });
+    let bound_access = grants::sign(&key, &bound).unwrap();
+    assert_eq!(
+        verifier
+            .verify(&bound_access, Purpose::Access)
+            .unwrap()
+            .http_request,
+        bound.http_request
+    );
+    bound.purpose = Purpose::Register;
+    assert!(grants::sign(&key, &bound).is_err());
     let db = temp.path().join("routes.db");
     let relay = Relay::new(verifier.clone(), &db).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -167,6 +186,30 @@ async fn acceptance() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    for (method, path) in [
+        (reqwest::Method::GET, "/echo"),
+        (reqwest::Method::POST, "/different"),
+        (reqwest::Method::POST, "/echo?extra=1"),
+    ] {
+        assert_eq!(
+            http.request(method, format!("{base}{path}"))
+                .header("x-trusted-access", &bound_access)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+    assert_eq!(
+        http.get(format!("http://{address}/v1/tunnel/{route}"))
+            .bearer_auth(&bound_access)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
     let response = http
         .get(format!("{base}/echo"))
         .header("x-trusted-access", &access)

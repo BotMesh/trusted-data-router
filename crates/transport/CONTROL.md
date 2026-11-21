@@ -27,3 +27,14 @@ Set `TRUSTED_ROUTER_ORIGINS=https://studio.example,https://clawup.example` on th
 The `fleet-service-access/v1` policy reference identifies the route ACL. It is **not** an action-policy proof. OpenShell enforcement, trusted-rail policy receipts, remote TEE attestation, and their activation gates remain separate concerns. Existing tokens are bounded bearer capabilities: Fleet scope revocation prevents renewal, while runtime deletion closes connectors immediately; otherwise existing grants can remain valid until expiry (15 minutes). Use the relay revoke operation for immediate revocation of a known execution.
 
 The reserved service name `control` is restricted to Fleet administrator credentials (checked with `/access` on every issuance). An ordinary namespace reader cannot receive its grant. Shim ingress/management services additionally verify the exact signed execution on the node. The relay overwrites `X-Trusted-Route` with the capability it has validated; it never forwards a client-supplied value as authority. A configured shim ingress can inject a native application's credential locally and expose only declared methods and paths.
+
+
+An application can bind an access grant to one HTTP invocation using
+`http_request: {id, method, path, body_sha256}` in its connection request. `id`
+is 32 random bytes encoded as lowercase hex; the digest covers the exact body
+bytes sent by the client. The relay rejects other methods, paths, query strings,
+WebSocket upgrades and raw TCP tunnels for these grants. A manifest-selected shim
+HTTP ingress must verify the body digest and durably consume the invocation ID
+before dispatch; this transport claim alone does not provide replay protection
+on an arbitrary raw app endpoint. Roll out compatible relay and shim binaries
+before issuing bound grants. This capability is not a policy-evaluation proof.

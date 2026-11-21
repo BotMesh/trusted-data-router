@@ -128,6 +128,8 @@ pub struct ConnectionRequest {
     pub execution: Option<ExecutionIdentity>,
     /// Stable opaque address saved by clients; never resolves to a replacement.
     pub route_id: Option<String>,
+    #[serde(default)]
+    pub http_request: Option<grants::HttpRequestBinding>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -300,6 +302,7 @@ impl Gateway {
             nbf: grants::now(),
             exp: grants::now() + GRANT_LIFETIME,
             purpose,
+            http_request: None,
             execution,
             service,
             policy: PolicyRef {
@@ -318,6 +321,9 @@ impl Gateway {
         fleet_token: &str,
         request: &ConnectionRequest,
     ) -> Result<Vec<Connection>> {
+        if let Some(binding) = &request.http_request {
+            binding.validate()?;
+        }
         if request.service.service == "control" {
             // Node administration is not granted by ordinary app read access.
             let mut response = self
@@ -359,7 +365,7 @@ impl Gateway {
             {
                 continue;
             }
-            let grant = self.grant(
+            let mut grant = self.grant(
                 instance.execution,
                 request.service.clone(),
                 Purpose::Access,
@@ -368,6 +374,7 @@ impl Gateway {
                     hex::encode(Sha256::digest(fleet_token.as_bytes()))
                 ),
             );
+            grant.http_request = request.http_request.clone();
             let route_id = grant.route_id();
             if request.route_id.as_ref().is_some_and(|r| r != &route_id) {
                 continue;

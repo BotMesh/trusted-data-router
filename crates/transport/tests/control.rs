@@ -103,6 +103,40 @@ async fn control_uses_live_fleet_scope_and_binds_node_and_stateful_clients() {
         );
     }
 
+    let binding = json!({"id":"ab".repeat(32),"method":"POST","path":"/v1/chat/completions","body_sha256":"cd".repeat(32)});
+    let bound: Value = http
+        .post(format!("{base}v1/runtime/connections"))
+        .bearer_auth("film-user")
+        .json(&json!({"service":service,"http_request":binding}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let verified = Verifier::new(&pubkey, "test".into())
+        .unwrap()
+        .verify(bound[0]["token"].as_str().unwrap(), Purpose::Access)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(verified.http_request.unwrap()).unwrap(),
+        binding
+    );
+    let mut invalid = binding.clone();
+    invalid["path"] = json!("/../admin");
+    assert_eq!(
+        http.post(format!("{base}v1/runtime/connections"))
+            .bearer_auth("film-user")
+            .json(&json!({"service":service,"http_request":invalid}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+
     let access = || {
         http.post(format!("{base}v1/runtime/connections"))
             .bearer_auth("film-user")

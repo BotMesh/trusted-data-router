@@ -17,6 +17,39 @@ pub enum Purpose {
     Revoke,
 }
 
+/// A single HTTP invocation approved by the application control plane. The
+/// node ingress checks the bytes and durably consumes `id` before dispatch.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpRequestBinding {
+    pub id: String,
+    pub method: String,
+    pub path: String,
+    pub body_sha256: String,
+}
+impl HttpRequestBinding {
+    pub fn validate(&self) -> Result<()> {
+        if [&self.id, &self.body_sha256].iter().any(|s| {
+            s.len() != 64
+                || !s
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) || !matches!(
+            self.method.as_str(),
+            "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE"
+        ) || !self.path.starts_with('/')
+            || self.path.len() > 256
+            || !self.path.is_ascii()
+            || self.path.contains(['%', '?', '#', '\\'])
+            || self.path.chars().any(char::is_control)
+            || self.path.split('/').any(|p| p == "." || p == "..")
+        {
+            return Err(Error::InvalidContract);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grant {
@@ -29,6 +62,8 @@ pub struct Grant {
     pub execution: ExecutionIdentity,
     pub service: ServiceId,
     pub policy: PolicyRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_request: Option<HttpRequestBinding>,
 }
 
 pub fn now() -> u64 {
@@ -47,6 +82,12 @@ impl Grant {
     }
 
     fn validate(&self, issuer: &str, purpose: Purpose, clock: u64) -> Result<()> {
+        if let Some(binding) = &self.http_request {
+            binding.validate()?;
+            if self.purpose != Purpose::Access {
+                return Err(Error::Unauthorized);
+            }
+        }
         let e = &self.execution;
         if self.iss != issuer
             || self.aud != AUDIENCE

@@ -371,6 +371,9 @@ pub(crate) async fn expires(exp: u64) {
 
 async fn tunnel(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResult {
     let grant = relay.authenticate(&req, Purpose::Access)?;
+    if grant.http_request.is_some() {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let session = relay.session(&grant)?;
     let slot = session
         .slots
@@ -476,6 +479,11 @@ async fn http_proxy(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpRe
         "/{}",
         path.strip_prefix(&prefix).ok_or(StatusCode::BAD_REQUEST)?
     );
+    if let Some(binding) = &grant.http_request {
+        if websocket || binding.path != path || binding.method != req.method().as_str() {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
     *req.uri_mut() = path.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
     strip_hop(req.headers_mut(), websocket);
     // A local shim ingress verifies the exact signed execution before injecting
