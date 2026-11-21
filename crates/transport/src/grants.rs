@@ -64,6 +64,8 @@ pub struct Grant {
     pub policy: PolicyRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_request: Option<HttpRequestBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<crate::authorization::AccessBinding>,
 }
 
 pub fn now() -> u64 {
@@ -82,6 +84,12 @@ impl Grant {
     }
 
     fn validate(&self, issuer: &str, purpose: Purpose, clock: u64) -> Result<()> {
+        if let Some(access) = &self.access {
+            access.validate()?;
+            if self.purpose != Purpose::Access || self.sub != access.principal {
+                return Err(Error::Unauthorized);
+            }
+        }
         if let Some(binding) = &self.http_request {
             binding.validate()?;
             if self.purpose != Purpose::Access {

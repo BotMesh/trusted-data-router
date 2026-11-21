@@ -115,7 +115,9 @@ def acceptance(fleet_binary, router_binary, root):
         fleet_process = launch("fleet", [fleet_binary, "--config", str(config)])
         eventually(lambda: (root / "fleet/admin.token").exists() and request(fleet + "/healthz")[0] == 200)
         admin = (root / "fleet/admin.token").read_text().strip()
-        assert request(fleet + "/namespaces", admin, "POST", {"name": "router-test"})[0] == 201
+        status, namespace = request(fleet + "/namespaces", admin, "POST", {"name": "router-test"})
+        assert status == 201
+        namespace = namespace["id"]
         token = secrets.token_hex(48)
         token_id = secrets.token_hex(16)
         assert request(fleet + "/tokens", admin, "POST", {"id": token_id, "address": secrets.token_hex(20),
@@ -134,21 +136,29 @@ def acceptance(fleet_binary, router_binary, root):
 
         grant = {"iss": "gateway", "aud": "trusted-data-router/v1", "sub": "test", "nbf": int(time.time()), "exp": int(time.time()) + 180,
             "purpose": "register", "http_request": None,
-            "execution": {"namespace": "router-test", "workload": "app", "allocation_id": "one", "lease_id": "first", "generation": 1, "node_id": "nat-node"},
-            "service": {"namespace": "router-test", "workload": "app", "service": "http"},
+            "execution": {"namespace": namespace, "workload": "app", "allocation_id": "one", "lease_id": "first", "generation": 1, "node_id": "nat-node"},
+            "service": {"namespace": namespace, "workload": "app", "service": "http"},
             "policy": {"issuer": "gateway", "policy_id": "network", "version": 1, "sha256": "ab" * 32}}
 
-        def connect(claims):
-            route = hashlib.sha256(json.dumps([claims["iss"], claims["execution"], claims["service"]], separators=(",", ":")).encode()).hexdigest()
-            signed = lambda purpose: subprocess.run([router_binary, "sign", str(private)], input=json.dumps(dict(claims, purpose=purpose)), text=True, capture_output=True, check=True).stdout.strip()
-            registration = write("register-" + str(claims["execution"]["generation"]), signed("register"))
-            access = signed("access")
-            launch("edge", [router_binary, "connect", f"ws://127.0.0.1:{rp}/v1/connect/{route}", f"127.0.0.1:{app.server_port}", str(registration)])
-            eventually(lambda: request(relay + "/v1/ready/" + route, access)[0] == 204)
+        def signed(claims, purpose):
+            claims = dict(claims, purpose=purpose)
+            if purpose == "register":
+                claims.pop("access", None)
+            return subprocess.run([router_binary, "sign", str(private)], input=json.dumps(claims), text=True, capture_output=True, check=True).stdout.strip()
+
+        def events(route, access):
             req = urllib.request.Request(relay + "/v1/http/" + route + "/events", headers={"X-Trusted-Access": access})
             stream = urllib.request.urlopen(req, timeout=40)
             assert stream.readline().startswith(b"data:")
-            return route, access, stream
+            return stream
+
+        def connect(claims):
+            route = hashlib.sha256(json.dumps([claims["iss"], claims["execution"], claims["service"]], separators=(",", ":")).encode()).hexdigest()
+            registration = write("register-" + str(claims["execution"]["generation"]), signed(claims, "register"))
+            access = signed(claims, "access")
+            launch("edge", [router_binary, "connect", f"ws://127.0.0.1:{rp}/v1/connect/{route}", f"127.0.0.1:{app.server_port}", str(registration)])
+            eventually(lambda: request(relay + "/v1/ready/" + route, access)[0] == 204)
+            return route, access, events(route, access)
 
         route, access, stream = connect(grant)
         assert request(fleet + f"/routers/relay-a/routes/{route}", admin, "DELETE")[0] == 200
@@ -176,11 +186,34 @@ def acceptance(fleet_binary, router_binary, root):
         launch("relay", relay_args, env)
         next_grant = copy.deepcopy(grant)
         next_grant["execution"].update(generation=2, lease_id="second")
-        _, _, stream = connect(next_grant)
+        backend = secrets.token_hex(48)
+        assert request(fleet + "/tokens", admin, "POST", {"id": secrets.token_hex(16), "address": secrets.token_hex(20),
+            "namespace": namespace, "permissions": ["read", "router_delegate"], "token_hash": hashlib.sha256(backend.encode()).hexdigest()})[0] == 201
+        policy = dict(namespace=namespace, workload="app", service="http", version=1, sha256="ab" * 32, enabled=True)
+        assert request(fleet + "/routers/relay-a/access-policy", admin, "PUT", policy)[0] == 200
+        identity = dict(namespace=namespace, workload="app", service="http", principal="11" * 32, session="aa" * 32)
+        status, binding = request(fleet + "/routers/relay-a/authorize", backend, "POST", identity)
+        assert status == 200
+        next_grant.update(sub=binding["principal"], access=binding)
+        next_route, _, stream = connect(next_grant)
         assert request(relay + "/v1/ready/" + route, access)[0] != 204
+        second = copy.deepcopy(next_grant)
+        second["access"]["session"] = "bb" * 32
+        second_stream = events(next_route, signed(second, "access"))
+        assert request(fleet + "/routers/relay-a/revoke-subject", backend, "POST",
+            {"namespace": namespace, "principal": identity["principal"], "session": identity["session"]})[0] == 200
+        eventually(lambda: request(fleet + "/routers/relay-a", admin)[1]["applied_authorization_revision"] == 2)
+        closed(stream, 2)
+        assert second_stream.readline()  # another session on the same connector continues
+        policy.update(version=2, sha256="cd" * 32)
+        assert request(fleet + "/routers/relay-a/access-policy", admin, "PUT", policy)[0] == 200
+        eventually(lambda: request(fleet + "/routers/relay-a", admin)[1]["applied_authorization_revision"] == 3)
+        closed(second_stream, 2)
+        second["access"].update(policy_version=2, policy_sha256=policy["sha256"])
+        stream = events(next_route, signed(second, "access"))  # same runtime/connector, new approved policy
         stop(fleet_process)
         closed(stream, 33)
-        print("PASS: real Fleet sync, applied ACK, live SSE revocation, durable restart, downgrade refusal, control outage expiry")
+        print("PASS: real Fleet sync, applied ACK, route/session revocation, policy upgrade without runtime replacement, durable restart, downgrade refusal, control outage expiry")
     finally:
         for process in reversed(children):
             stop(process)

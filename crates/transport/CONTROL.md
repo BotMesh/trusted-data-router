@@ -28,7 +28,7 @@ cluster token on the relay.
 
 The relay initiates `POST /routers/relay-a/sync` every five seconds. HTTPS is
 required except for numeric loopback test endpoints. Redirects are refused;
-requests time out after ten seconds and responses are bounded to 512 KiB.
+requests time out after ten seconds and responses are bounded to 1 MiB.
 The initial request has `epoch:null`, `after_revision:0`, `applied_revision:null`.
 Fleet returns the epoch, full revocation snapshot, revision and a 30-second
 control lease. Subsequent requests carry the persisted epoch and cursor; Fleet
@@ -64,12 +64,69 @@ router and reissue grants, or revoke the sync token to suspend the whole router.
 Never reset state while reusing the old issuer: that would revive old grants.
 Tokens, epochs, issuer and control endpoint are not silently reset.
 
-This first stream synchronizes exact-route revocations and freshness. Policy
-versions, grant signing-key rotation, end-user/session revocation and automatic
-app lifecycle-to-route revocation are not yet synchronized. A route revocation
-affects every client of that execution/service; business backends still check
-user/project ownership before issuing access. This is not complete end-user
-tenant isolation.
+### User/session authorization and access policy versions
+
+Fleet administrators opt a router into identity enforcement by putting an exact
+service policy at `PUT /routers/relay-a/access-policy`:
+
+```json
+{"namespace":"<32 lowercase hex namespace ID>","workload":"agent-a","service":"chat","version":1,"sha256":"<64 lowercase hex policy digest>","enabled":true}
+```
+
+The first policy activates enforcement for the whole router: all access needs a
+signed identity and an enabled exact namespace/workload/service policy. Provision
+all intended policies before switching traffic. Changing the policy digest or
+`enabled` requires a strictly greater version; exact replay is idempotent.
+Connector registration retains its execution policy and remains connected across
+access-policy changes. Policies are approved references, not executable rules or
+proofs of a PolicyEngine evaluation.
+
+Set `TRUSTED_GATEWAY_ROUTER_ID=relay-a` in the embedding backend's existing
+environment. Issue that backend a namespace token with `read,router_delegate`, no
+app/tag restrictions or other permissions. This is an explicitly trusted identity
+delegation credential, never a browser token. The backend first authenticates its
+user and verifies workload ownership, then calls `Gateway::connections` with
+`identity: {principal, session}`. Both are opaque, domain-separated SHA-256 IDs.
+An optional `expires_at` further bounds the 15-minute grant by the business
+credential's expiry. Fleet's `/routers/relay-a/authorize` checks the delegation
+namespace, revocations and current service policy before returning a binding to
+sign. Administrator credentials cannot act as delegated identities.
+
+`POST /routers/relay-a/revoke-subject` accepts
+`{namespace, principal, session}`. A namespace delegate can revoke only its own
+namespace; administrators may operate across namespaces. Set `session` to null
+to revoke every session of a principal, including future grants using that ID.
+Revocations are permanent; a new login must have a fresh session ID. The gateway's
+`revoke_identity` helper derives the namespace from the backend credential.
+Backends must await durable revocation before deleting their own credential and
+reporting logout/key deletion as successful. Persistence success is not an
+immediate enforcement ACK: existing traffic stops after the next successful poll,
+or by the 30-second control-lease deadline during an outage.
+
+The separate `authorization.revision` is delivered as a full bounded snapshot on
+each poll and acknowledged via `applied_authorization_revision` only after SQLite
+commit and cancellation. Fleet status includes `delivered_authorization_revision`
+and `applied_authorization_revision`. The relay rejects removed revocations,
+policy rollback, snapshot removal and conflicting equal revisions. Session/user
+revocation cancels only matching access streams; policy changes cancel matching
+old-version streams. New grants reuse the existing connector. Restart requires a
+fresh sync before access resumes. Legacy grants are rejected after activation;
+scoped grants are rejected on a relay without authorization state.
+
+Deploy the new Fleet, relay **and shim grant parser** before enabling identity
+mode in the backend. Older shims reject the additive access claim. Do not enable
+it on a shared relay until all its clients support identities. Unconfigured
+routers, legacy workloads and runtime allocation identities are unchanged.
+Signing-key rotation and automatic app-lifecycle revocation remain separate work.
+Business ownership is still enforced by the backend; a delegate is trusted to
+assert identities within its namespace, not to grant access across namespaces.
+
+The authorization snapshot currently holds at most 1024 policies plus permanent
+subject revocations. New records fail with 507 at capacity; existing records are
+never dropped. This is a bounded initial rollout, not an unbounded logout store.
+Pagination and safe credential-expiry-based collection are required before a
+large rollout. A new router with a new issuer/key can replace a full router only
+with explicit grant reissuance and withdrawal of the old router.
 
 Run the actual cross-repository acceptance after building both binaries:
 
@@ -80,7 +137,7 @@ python3 tools/test_fleet_control.py \
 ```
 
 It starts an isolated Fleet scheduler, relay, outbound edge connector and SSE
-service, checks revocation/ACK/restart/control outage, and cleans up its private
+service, checks route/session revocation, policy upgrade on one connector, ACK/restart/control outage, and cleans up its private
 temporary state. It never starts a prover or contacts a configured production
 Fleet. Fleet's PostgreSQL tests separately cover migration, concurrent writes
 and restart durability.

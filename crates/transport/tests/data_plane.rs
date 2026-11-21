@@ -159,6 +159,7 @@ async fn managed_acceptance() {
         exp: grants::now() + 120,
         purpose: Purpose::Register,
         http_request: None,
+        access: None,
         execution: ExecutionIdentity {
             namespace: "film".into(),
             workload: "app".into(),
@@ -355,6 +356,7 @@ async fn acceptance() {
         exp: grants::now() + 120,
         purpose: Purpose::Register,
         http_request: None,
+        access: None,
         execution: ExecutionIdentity {
             namespace: "film".into(),
             workload: "qwen".into(),

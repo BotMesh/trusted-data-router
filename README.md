@@ -171,3 +171,7 @@ no application bytes and does not consume a request-bound grant. Fleet health
 and relay registration can become ready at different times after a restart.
 `Gateway::ready` exposes this check to embedding applications. Availability can
 still change after the check; never automatically replay an ambiguous mutation.
+
+Fleet-managed access can bind each stream to a business principal/session and
+current service policy. See [control synchronization](crates/transport/CONTROL.md)
+for opt-in rollout, delegated namespace permissions, applied ACKs and capacity limits.

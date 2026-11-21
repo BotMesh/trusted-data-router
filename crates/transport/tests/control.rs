@@ -71,6 +71,9 @@ async fn control_uses_live_fleet_scope_and_binds_node_and_stateful_clients() {
     let (fleet, fleet_task) = listen(
         Router::new()
             .route("/access", get(|headers: HeaderMap| async move { Json(json!({"permissions":if headers.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer administrator") {vec!["admin"]} else {vec!["read"]}})) }))
+            .route("/routers/relay/authorize", axum::routing::post(|Json(request): Json<Value>| async move {
+                Json(json!({"principal":request["principal"],"session":request["session"],"policy_version":7,"policy_sha256":"ef".repeat(32)}))
+            }))
             .route("/apps/comfy", get(app))
             .with_state(view.clone()),
     )
@@ -84,9 +87,31 @@ async fn control_uses_live_fleet_scope_and_binds_node_and_stateful_clients() {
         fleet_token,
     )
     .unwrap();
-    let (base, task) = listen(gateway.router()).await;
+    let (base, task) = listen(gateway.clone().router()).await;
     let http = reqwest::Client::new();
     let service = json!({"namespace":"film","workload":"comfy","service":"http"});
+    let managed = gateway.with_authorization("relay").unwrap();
+    let identity = json!({"principal":"11".repeat(32),"session":"22".repeat(32)});
+    let expires_at = grants::now() + 30;
+    let scoped = serde_json::from_value(
+        json!({"service":service,"identity":identity,"expires_at":expires_at}),
+    )
+    .unwrap();
+    let connections = managed.connections("film-user", &scoped).await.unwrap();
+    let scoped_grant = Verifier::new(&pubkey, "test".into())
+        .unwrap()
+        .verify(&connections[0].token, Purpose::Access)
+        .unwrap();
+    assert_eq!(scoped_grant.sub, identity["principal"]);
+    assert_eq!(scoped_grant.access.unwrap().policy_version, 7);
+    assert_eq!(scoped_grant.exp, expires_at);
+    assert!(managed
+        .connections(
+            "film-user",
+            &serde_json::from_value(json!({"service":service})).unwrap()
+        )
+        .await
+        .is_err());
     let request = json!({"service":service});
     let control_request =
         json!({"service":{"namespace":"film","workload":"comfy","service":"control"}});

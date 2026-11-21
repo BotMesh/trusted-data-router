@@ -104,6 +104,7 @@ pub struct Gateway {
     node_key: DecodingKey,
     registration_token_file: PathBuf,
     client: reqwest::Client,
+    authorization_router: Option<String>,
 }
 #[derive(Deserialize)]
 struct AppView {
@@ -130,6 +131,11 @@ pub struct ConnectionRequest {
     pub route_id: Option<String>,
     #[serde(default)]
     pub http_request: Option<grants::HttpRequestBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::authorization::AccessIdentity>,
+    /// A backend can shorten a grant to the remaining authenticated session life.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -182,6 +188,7 @@ impl Gateway {
             signing_key: private_key.into(),
             node_key,
             registration_token_file,
+            authorization_router: None,
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(10))
@@ -200,15 +207,120 @@ impl Gateway {
         let key = private_file(Path::new(&value("TRUSTED_GATEWAY_SIGNING_KEY_FILE")?))?;
         let public = std::fs::read(value("TRUSTED_GATEWAY_PUBLIC_KEY_FILE")?)
             .map_err(|_| Error::Unavailable)?;
-        Self::new(
+        let gateway = Self::new(
             &fleet,
             &value("TRUSTED_GATEWAY_RELAY_URL")?,
             value("TRUSTED_GATEWAY_ISSUER")?,
             &key,
             &public,
             value("TRUSTED_GATEWAY_FLEET_TOKEN_FILE")?.into(),
+        )?;
+        match std::env::var("TRUSTED_GATEWAY_ROUTER_ID") {
+            Ok(id) => gateway.with_authorization(&id).map(Some),
+            Err(std::env::VarError::NotPresent) => Ok(Some(gateway)),
+            Err(_) => Err(Error::InvalidContract),
+        }
+    }
+
+    pub fn with_authorization(mut self: Arc<Self>, router_id: &str) -> Result<Arc<Self>> {
+        if !crate::sync::valid_id(router_id) {
+            return Err(Error::InvalidContract);
+        }
+        Arc::make_mut(&mut self).authorization_router = Some(router_id.into());
+        Ok(self)
+    }
+    pub fn manages_identities(&self) -> bool {
+        self.authorization_router.is_some()
+    }
+
+    async fn fleet_json(&self, request: reqwest::RequestBuilder) -> Result<serde_json::Value> {
+        let mut response = request.send().await.map_err(|_| Error::Unavailable)?;
+        if !response.status().is_success() {
+            return Err(if matches!(response.status().as_u16(), 401 | 403 | 404) {
+                Error::Unauthorized
+            } else {
+                Error::Unavailable
+            });
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| Error::Unavailable)? {
+            if bytes.len() + chunk.len() > 1024 * 1024 {
+                return Err(Error::Unavailable);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| Error::Unavailable)
+    }
+    async fn access_binding(
+        &self,
+        token: &str,
+        request: &ConnectionRequest,
+    ) -> Result<Option<crate::authorization::AccessBinding>> {
+        let Some(router) = &self.authorization_router else {
+            return if request.identity.is_none() {
+                Ok(None)
+            } else {
+                Err(Error::InvalidContract)
+            };
+        };
+        let identity = request.identity.as_ref().ok_or(Error::Unauthorized)?;
+        identity.validate()?;
+        let url = self
+            .fleet
+            .join(&format!("routers/{router}/authorize"))
+            .map_err(|_| Error::InvalidContract)?;
+        let binding: crate::authorization::AccessBinding = serde_json::from_value(self.fleet_json(self.client.post(url).bearer_auth(token)
+            .json(&serde_json::json!({"namespace":request.service.namespace,"workload":request.service.workload,"service":request.service.service,
+                "principal":identity.principal,"session":identity.session}))).await?).map_err(|_| Error::Unavailable)?;
+        binding.validate()?;
+        if binding.principal != identity.principal || binding.session != identity.session {
+            return Err(Error::Unauthorized);
+        }
+        Ok(Some(binding))
+    }
+    /// A namespace-wide backend delegation credential revokes only its own
+    /// identities. Raw user credentials never cross into Fleet or the relay.
+    pub async fn revoke_identity(
+        &self,
+        token: &str,
+        identity: &crate::authorization::AccessIdentity,
+    ) -> Result<()> {
+        identity.validate()?;
+        let router = self
+            .authorization_router
+            .as_ref()
+            .ok_or(Error::InvalidContract)?;
+        let access = self
+            .fleet_json(
+                self.client
+                    .get(
+                        self.fleet
+                            .join("access")
+                            .map_err(|_| Error::InvalidContract)?,
+                    )
+                    .bearer_auth(token),
+            )
+            .await?;
+        let namespace = access["namespace"].as_str().ok_or(Error::Unauthorized)?;
+        if !access["permissions"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|v| v == "router_delegate"))
+        {
+            return Err(Error::Unauthorized);
+        }
+        let url = self
+            .fleet
+            .join(&format!("routers/{router}/revoke-subject"))
+            .map_err(|_| Error::InvalidContract)?;
+        self.fleet_json(
+            self.client
+                .post(url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({"namespace":namespace,
+            "principal":identity.principal,"session":identity.session})),
         )
-        .map(Some)
+        .await?;
+        Ok(())
     }
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
@@ -303,6 +415,7 @@ impl Gateway {
             exp: grants::now() + GRANT_LIFETIME,
             purpose,
             http_request: None,
+            access: None,
             execution,
             service,
             policy: PolicyRef {
@@ -324,6 +437,7 @@ impl Gateway {
         if let Some(binding) = &request.http_request {
             binding.validate()?;
         }
+        let binding = self.access_binding(fleet_token, request).await?;
         if request.service.service == "control" {
             // Node administration is not granted by ordinary app read access.
             let mut response = self
@@ -375,6 +489,13 @@ impl Gateway {
                 ),
             );
             grant.http_request = request.http_request.clone();
+            if let Some(expiry) = request.expires_at {
+                grant.exp = grant.exp.min(expiry);
+            }
+            if let Some(binding) = &binding {
+                grant.sub = binding.principal.clone();
+                grant.access = Some(binding.clone());
+            }
             let route_id = grant.route_id();
             if request.route_id.as_ref().is_some_and(|r| r != &route_id) {
                 continue;
