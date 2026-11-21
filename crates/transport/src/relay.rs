@@ -9,7 +9,7 @@ use axum::{
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
     response::Response,
-    routing::{any, delete, get},
+    routing::{any, delete, get, post},
     Router,
 };
 use futures::future::poll_fn;
@@ -27,7 +27,7 @@ use std::{
 };
 use tokio::{
     net::TcpListener,
-    sync::{mpsc, oneshot, Semaphore},
+    sync::{mpsc, oneshot, Notify, Semaphore},
 };
 use tokio_tungstenite::{
     tungstenite::{handshake::derive_accept_key, protocol::Role},
@@ -43,10 +43,24 @@ type Open = oneshot::Sender<yamux::Stream>;
 
 pub(crate) struct Session {
     grant: Grant,
+    expires_at: AtomicU64,
+    renewed: Notify,
     serial: u64,
     open: mpsc::Sender<Open>,
     pub(crate) cancel: CancellationToken,
     slots: Arc<Semaphore>,
+}
+impl Session {
+    async fn expired(&self) {
+        loop {
+            let changed = self.renewed.notified();
+            let deadline = self.expires_at.load(Ordering::Acquire);
+            if deadline <= grants::now() {
+                return;
+            }
+            tokio::select! { _ = changed => {}, _ = expires(deadline) => {} }
+        }
+    }
 }
 pub(crate) struct Directory {
     pub(crate) db: Connection,
@@ -112,6 +126,7 @@ impl Relay {
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
             .route("/v1/connect/{route}", get(connect))
+            .route("/v1/connect/{route}/renew", post(renew))
             .route("/v1/tunnel/{route}", get(tunnel))
             .route("/v1/ready/{route}", get(ready))
             .route("/v1/http/{route}/", any(http_proxy))
@@ -184,7 +199,7 @@ impl Relay {
             .get(&grant.route_id())
             .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
         if session.cancel.is_cancelled()
-            || session.grant.exp <= grants::now()
+            || session.expires_at.load(Ordering::Acquire) <= grants::now()
             || session.grant.policy != grant.policy
         {
             return Err(StatusCode::FORBIDDEN);
@@ -328,6 +343,8 @@ async fn connect(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResul
     let (tx, mut rx) = mpsc::channel::<Open>(64);
     let cancel = CancellationToken::new();
     let session = Arc::new(Session {
+        expires_at: AtomicU64::new(grant.exp),
+        renewed: Notify::new(),
         grant,
         serial: relay.serial.fetch_add(1, Ordering::Relaxed),
         open: tx,
@@ -436,7 +453,7 @@ async fn connect(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResul
             }
             Ok::<(), ()>(())
         };
-        tokio::select! { _ = run => {}, _ = cancel.cancelled() => {}, _ = expires(session.grant.exp) => {} }
+        tokio::select! { _ = run => {}, _ = cancel.cancelled() => {}, _ = session.expired() => {} }
         cancel.cancel();
         if let Ok(mut directory) = relay.directory.lock() {
             if directory
@@ -449,6 +466,40 @@ async fn connect(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResul
         }
     });
     Ok(response)
+}
+
+/// Renew only the node's existing transport lease. This never extends an
+/// application Access grant, changes its policy, or resurrects a revoked route.
+async fn renew(State(relay): State<Arc<Relay>>, req: Request) -> HttpResult {
+    let grant = relay.authenticate(&req, Purpose::Register)?;
+    let mut directory = relay
+        .directory
+        .lock()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    directory.check_control()?;
+    let session = directory
+        .sessions
+        .get(&grant.route_id())
+        .ok_or(StatusCode::CONFLICT)?;
+    let old = &session.grant;
+    if session.cancel.is_cancelled()
+        || session.expires_at.load(Ordering::Acquire) <= grants::now()
+        || old.iss != grant.iss
+        || old.sub != grant.sub
+        || old.execution != grant.execution
+        || old.service != grant.service
+        || old.policy != grant.policy
+        || old.access != grant.access
+        || old.http_request != grant.http_request
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    session.expires_at.fetch_max(grant.exp, Ordering::AcqRel);
+    session.renewed.notify_one();
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap())
 }
 
 async fn open(session: &Session) -> std::result::Result<yamux::Stream, StatusCode> {

@@ -252,3 +252,18 @@ The local acceptance uses actual ClawUp runtime images and a CPU Film service
 fixture. GPU inference, production TLS/storage connectivity, OpenShell admission
 and TEE/policy proofs require their own deployment validation. A connection grant
 or applied-control ACK must never be reported as one of those proofs.
+
+# Registration lease renewal
+
+`POST /v1/connect/{route_id}/renew` accepts a fresh Bearer Register grant for an
+existing connector. The exact issuer, node subject, execution, service and route
+policy must match the original registration. Expired, disconnected, revoked or
+replaced connectors cannot be revived by renewal. The deadline only increases;
+replaying an older still-valid registration cannot shorten it.
+
+This extends only the connector registration deadline, leaving its multiplexed
+transport and existing streams in place. Each application Access grant retains its
+own expiry and policy/session revocation checks. An Access grant cannot renew a
+connector. Managed relays still require a current Fleet synchronization lease.
+Deploy relay support before enabling continuous renewal in node shims; older
+relays fail renewal and the shim reconnects at the original registration expiry.
