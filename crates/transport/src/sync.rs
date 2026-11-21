@@ -299,7 +299,11 @@ impl ControlClient {
                     .ok_or(Error::InvalidContract)
             })
             .collect::<Result<_>>()?;
-        Self::new(&values[0], values[1].clone(), PathBuf::from(&values[2])).map(Some)
+        let mut client = Self::new(&values[0], values[1].clone(), PathBuf::from(&values[2]))?;
+        if let Some(ca) = crate::control::ca_from_env("TRUSTED_ROUTER_FLEET_CA_FILE")? {
+            client.http = crate::control::http_client(Some(&ca))?;
+        }
+        Ok(Some(client))
     }
     /// A request acknowledges only the prior transaction, never the response
     /// about to be received. A crash before acknowledgment simply replays it.

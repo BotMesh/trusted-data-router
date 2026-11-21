@@ -82,7 +82,7 @@ impl AuthorizationState {
         let mut policies = std::collections::HashSet::new();
         for p in &self.policies {
             if !namespace(&p.namespace)
-                || !name(&p.workload)
+                || !(p.workload == "*" || name(&p.workload))
                 || !name(&p.service)
                 || p.version == 0
                 || !valid_route(&p.sha256)
@@ -130,13 +130,25 @@ impl AuthorizationState {
             r.namespace == grant.execution.namespace
                 && r.principal == binding.principal
                 && r.session.as_ref().is_none_or(|s| s == &binding.session)
-        }) && self.policies.iter().any(|p| {
-            p.namespace == grant.execution.namespace
-                && p.workload == grant.service.workload
-                && p.service == grant.service.service
-                && p.enabled
-                && p.version == binding.policy_version
-                && p.sha256 == binding.policy_sha256
-        })
+        }) && {
+            let scoped = |p: &&AccessPolicy| {
+                p.namespace == grant.execution.namespace && p.service == grant.service.service
+            };
+            self.policies
+                .iter()
+                .filter(scoped)
+                .find(|p| p.workload == grant.service.workload)
+                .or_else(|| {
+                    self.policies
+                        .iter()
+                        .filter(scoped)
+                        .find(|p| p.workload == "*")
+                })
+                .is_some_and(|p| {
+                    p.enabled
+                        && p.version == binding.policy_version
+                        && p.sha256 == binding.policy_sha256
+                })
+        }
     }
 }

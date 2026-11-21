@@ -78,14 +78,17 @@ async fn control_uses_live_fleet_scope_and_binds_node_and_stateful_clients() {
             .with_state(view.clone()),
     )
     .await;
+    let unavailable_default = tmp.path().join("no-default-reader");
     let gateway = Gateway::new(
         &fleet,
         "https://relay.example/",
         "test".into(),
         &key,
         &pubkey,
-        fleet_token,
+        unavailable_default,
     )
+    .unwrap()
+    .with_registration_tokens([("film".into(), fleet_token)].into())
     .unwrap();
     let (base, task) = listen(gateway.clone().router()).await;
     let http = reqwest::Client::new();
@@ -115,6 +118,27 @@ async fn control_uses_live_fleet_scope_and_binds_node_and_stateful_clients() {
     let request = json!({"service":service});
     let control_request =
         json!({"service":{"namespace":"film","workload":"comfy","service":"control"}});
+    let probe_request = serde_json::from_value(json!({"service":service})).unwrap();
+    assert!(managed.probes("film-user", &probe_request).await.is_err());
+    let probes = managed
+        .probes("administrator", &probe_request)
+        .await
+        .unwrap();
+    let probe = Verifier::new(&pubkey, "test".into())
+        .unwrap()
+        .verify(&probes[0].token, Purpose::Probe)
+        .unwrap();
+    assert_eq!(probe.exp - probe.nbf, 30);
+    assert!(probe.access.is_none());
+    for purpose in [Purpose::Access, Purpose::Register, Purpose::Revoke] {
+        assert!(Verifier::new(&pubkey, "test".into())
+            .unwrap()
+            .verify(&probes[0].token, purpose)
+            .is_err());
+    }
+    let mut too_long = probe;
+    too_long.exp = too_long.nbf + 31;
+    assert!(grants::sign(&key, &too_long).is_err());
     let managed_control = serde_json::from_value(control_request.clone()).unwrap();
     assert!(managed
         .connections("film-user", &managed_control)

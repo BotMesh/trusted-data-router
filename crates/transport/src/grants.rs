@@ -15,6 +15,8 @@ pub enum Purpose {
     Register,
     Access,
     Revoke,
+    /// Read-only route availability; cannot open application streams.
+    Probe,
 }
 
 /// A single HTTP invocation approved by the application control plane. The
@@ -103,6 +105,7 @@ impl Grant {
             || self.nbf > clock
             || self.exp <= clock
             || self.exp.saturating_sub(self.nbf) > MAX_LIFETIME
+            || self.purpose == Purpose::Probe && self.exp.saturating_sub(self.nbf) > 30
             || e.generation == 0
             || self.service.namespace != e.namespace
             || self.service.workload != e.workload

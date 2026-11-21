@@ -176,7 +176,9 @@ impl Relay {
             .lock()
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         directory.check_control()?;
-        directory.check_access(grant)?;
+        if grant.purpose != Purpose::Probe {
+            directory.check_access(grant)?;
+        }
         let session = directory
             .sessions
             .get(&grant.route_id())
@@ -467,7 +469,9 @@ pub(crate) async fn expires(exp: u64) {
 /// Observe the exact route without sending application bytes or consuming an
 /// HTTP invocation. Availability is advisory; mutations still must not replay.
 async fn ready(State(relay): State<Arc<Relay>>, req: Request) -> HttpResult {
-    let grant = relay.authenticate(&req, Purpose::Access)?;
+    let grant = relay
+        .authenticate(&req, Purpose::Access)
+        .or_else(|_| relay.authenticate(&req, Purpose::Probe))?;
     let session = relay.session(&grant)?;
     if session.open.is_closed() {
         return Err(StatusCode::SERVICE_UNAVAILABLE);

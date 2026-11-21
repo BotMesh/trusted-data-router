@@ -66,20 +66,26 @@ Tokens, epochs, issuer and control endpoint are not silently reset.
 
 ### User/session authorization and access policy versions
 
-Fleet administrators opt a router into identity enforcement by putting an exact
+Fleet administrators opt a router into identity enforcement by putting a scoped
 service policy at `PUT /routers/relay-a/access-policy`:
 
 ```json
-{"namespace":"<32 lowercase hex namespace ID>","workload":"agent-a","service":"chat","version":1,"sha256":"<64 lowercase hex policy digest>","enabled":true}
+{"namespace":"<32 lowercase hex namespace ID>","workload":"*","service":"chat","version":1,"sha256":"<64 lowercase hex policy digest>","enabled":true}
 ```
 
 The first policy activates enforcement for the whole router: all access needs a
-signed identity and an enabled exact namespace/workload/service policy. Provision
+signed identity and an enabled namespace/workload/service policy. Provision
 all intended policies before switching traffic. Changing the policy digest or
 `enabled` requires a strictly greater version; exact replay is idempotent.
 Connector registration retains its execution policy and remains connected across
 access-policy changes. Policies are approved references, not executable rules or
 proofs of a PolicyEngine evaluation.
+
+`workload: "*"` supplies an administrator-approved default for one namespace and
+service, so creating a new agent does not require a new policy. An exact workload
+entry always takes precedence, including an explicit `enabled: false`. Namespace
+and service cannot be wildcards; connection requests still name an exact workload.
+Upgrade both Fleet and the relay before publishing wildcard policies.
 
 Set `TRUSTED_GATEWAY_ROUTER_ID=relay-a` in the embedding backend's existing
 environment. Issue that backend a namespace token with `read,router_delegate`, no
@@ -125,6 +131,15 @@ Signing-key rotation and automatic app-lifecycle revocation remain separate work
 Business ownership is still enforced by the backend; a delegate is trusted to
 assert identities within its namespace, not to grant access across namespaces.
 
+Film's Qwen/FLUX API keys, model permissions and project access stay in Film.
+ClawUp's login/chat credentials and bot ownership stay in ClawUp. Fleet receives
+opaque connection subjects and revocations, never these business credentials or
+model-level permission decisions. The application authenticates and authorizes
+before requesting a connection; a caller-supplied identity is not authentication.
+Film's internal worker may use a workspace service identity after Studio has
+authorized the operation. Do not expose that worker delegate or grants to browser
+users as a substitute for Studio's per-user API.
+
 The authorization snapshot currently holds at most 1024 policies plus permanent
 subject revocations. New records fail with 507 at capacity; existing records are
 never dropped. This is a bounded initial rollout, not an unbounded logout store.
@@ -157,6 +172,9 @@ Use existing process environment:
 - `TRUSTED_GATEWAY_ISSUER`: deployment-specific issuer shared with relay and shim.
 - `TRUSTED_GATEWAY_SIGNING_KEY_FILE`, `TRUSTED_GATEWAY_PUBLIC_KEY_FILE`: Ed25519 PEM keys; private key absolute and mode 0600.
 - `TRUSTED_GATEWAY_FLEET_TOKEN_FILE`: absolute, private, read-only Fleet credential covering the enrolled runtime namespaces, used only for node registration validation.
+- `TRUSTED_GATEWAY_NAMESPACE_TOKEN_FILES`: optional JSON object mapping namespace IDs to absolute private registration-reader token paths. Use separate namespace readers when one gateway serves Film and ClawUp; unmapped namespaces use the default file. No administrator credential is needed in the gateway's environment.
+- `TRUSTED_GATEWAY_CA_FILE`: optional PEM trust anchor for private Fleet/relay TLS endpoints; certificate and hostname verification remain enabled.
+- `TRUSTED_ROUTER_FLEET_CA_FILE`: optional PEM trust anchor on the relay for its Fleet sync endpoint.
 
 The Fleet server must expose `runtime_instances` (ProjectZKM/zkm-fleet #98). Every issuance queries Fleet afresh and fails closed if Fleet is unavailable. Registration requires a separate node bootstrap JWT. Application access uses the caller's Fleet token, so Fleet enforces namespace/tag/app grants. Backend applications can call `Gateway::connections` with their own Fleet credential **after checking user ownership of the selected workload**.
 
@@ -167,6 +185,21 @@ POST `/v1/runtime/connections` with `Authorization: Bearer <Fleet token>`:
 ```
 
 Returns one descriptor per current ready execution: execution identity, service, opaque `route_id`, HTTPS `base_url`, access `token`, and `expires_at`. Use `X-Trusted-Access: <token>` on the relay. Preserve the application's native Authorization header. Tokens expire after 15 minutes; refresh before a new request. Refresh with the same `execution` or `route_id` to preserve stateful affinity. An expired/removed instance returns 503; it is never redirected to a replacement. An active stream ends at grant expiry; do not replay state-changing requests automatically.
+
+`route_id` is the SHA-256 of the canonical serialized `[issuer, execution, service]`
+tuple. A shim registers an outbound connection under this ID. The relay checks the
+request's signed target against the URL and registered execution, then removes
+`/v1/http/{route_id}` and forwards the remaining path through that connection.
+Clients cannot supply a destination IP/port. Refreshing a grant preserves the ID;
+a replacement allocation or generation changes it. The ID is an address, not a
+credential. Model names and business API keys do not select routes.
+
+POST `/v1/runtime/probes` takes the same service/execution selector and requires a
+Fleet administrator. It issues a separate 30-second `probe` capability accepted
+only by GET `/v1/ready/{route_id}`. It cannot send HTTP, SSE, WebSocket or TCP app
+traffic, register a connector, or revoke a route. Provisioners use it to observe
+connectivity without impersonating a chat user. Probes still require fresh Fleet
+sync and a non-revoked live execution; they do not assert business authorization.
 
 POST `/v1/runtime/registration` accepts the shim's execution and service declaration. The node JWT must match that exact node and namespace, and Fleet must still report that exact execution/service as ready. A route grant cannot be used as a node credential. Node bootstrap JWTs have audience `trusted-runtime-node/v1`, issuer matching the gateway, `sub` equal to the Fleet node identity, an explicit `namespaces` list, `nbf` and `exp` (maximum 30 days). Enroll with `trusted-data-router enroll-node PRIVATE_KEY` and the claims on stdin; store stdout atomically in a node-only mode-0600 file. Operators verify the node through their existing Fleet onboarding process. This enrollment does not assert TEE attestation. Rotate bootstrap credentials before expiry.
 
@@ -186,3 +219,36 @@ HTTP ingress must verify the body digest and durably consume the invocation ID
 before dispatch; this transport claim alone does not provide replay protection
 on an arbitrary raw app endpoint. Roll out compatible relay and shim binaries
 before issuing bound grants. This capability is not a policy-evaluation proof.
+
+## First migration gate
+
+1. Deploy the compatible Fleet scheduler/node/bridge, shim, relay and embedding
+   gateway before enabling traffic. Keep PostgreSQL and relay SQLite durable;
+   keep a distinct router ID/issuer/key for this pilot. Existing legacy apps keep
+   their executor until explicitly changed.
+2. Enroll a dedicated `router_sync` token, issue separate `read,router_delegate`
+   credentials per application namespace, and enroll node bootstrap credentials
+   for only the intended namespaces. Provision the required service defaults and
+   exact exceptions. Business API keys remain application-owned.
+3. Read `GET /routers/ID` as an operator: require `applied_revision == revision`,
+   `applied_authorization_revision == authorization.revision`, and a fresh
+   `applied_ms` (less than 30 seconds old). Reserve headroom below 4096 route
+   tombstones and 1024 total policies/subject revocations; do not start a large
+   rollout before safe collection is implemented.
+4. Verify TLS with the deployed CA, outbound connectivity, node images, routable
+   dependencies and portable storage. Run `tools/test_private_ca.py` with
+   `--router-binary /absolute/path/to/trusted-data-router` for the isolated TLS
+   regression and `tools/test_fleet_control.py` for sync/outage/stream revocation.
+   ClawUp's `runtime-provisioner/tests/fleet_cluster.py --film-repo ...` exercises
+   both clients through real Fleet/Ray/shim containers with synthetic credentials.
+5. Start one new pilot runtime per application. Check cross-namespace denial,
+   grant expiry/revocation, backups and stateful affinity before migrating an
+   existing workload. Drain in-flight Film prompts on the old worker; old route
+   URLs must never be remapped. For a ClawUp bot, stop and back up before restoring
+   under Fleet, and keep only one active allocation. Rollback is explicit: stop
+   the pilot allocation before restoring the prior executor and latest backup.
+
+The local acceptance uses actual ClawUp runtime images and a CPU Film service
+fixture. GPU inference, production TLS/storage connectivity, OpenShell admission
+and TEE/policy proofs require their own deployment validation. A connection grant
+or applied-control ACK must never be reported as one of those proofs.

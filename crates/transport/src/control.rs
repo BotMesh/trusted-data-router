@@ -103,6 +103,7 @@ pub struct Gateway {
     signing_key: Vec<u8>,
     node_key: DecodingKey,
     registration_token_file: PathBuf,
+    namespace_tokens: std::collections::HashMap<String, PathBuf>,
     client: reqwest::Client,
     authorization_router: Option<String>,
 }
@@ -188,12 +189,9 @@ impl Gateway {
             signing_key: private_key.into(),
             node_key,
             registration_token_file,
+            namespace_tokens: Default::default(),
             authorization_router: None,
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(10))
-                .build()
-                .map_err(|_| Error::Unavailable)?,
+            client: http_client(None)?,
         }))
     }
 
@@ -207,7 +205,7 @@ impl Gateway {
         let key = private_file(Path::new(&value("TRUSTED_GATEWAY_SIGNING_KEY_FILE")?))?;
         let public = std::fs::read(value("TRUSTED_GATEWAY_PUBLIC_KEY_FILE")?)
             .map_err(|_| Error::Unavailable)?;
-        let gateway = Self::new(
+        let mut gateway = Self::new(
             &fleet,
             &value("TRUSTED_GATEWAY_RELAY_URL")?,
             value("TRUSTED_GATEWAY_ISSUER")?,
@@ -215,11 +213,37 @@ impl Gateway {
             &public,
             value("TRUSTED_GATEWAY_FLEET_TOKEN_FILE")?.into(),
         )?;
+        if let Some(ca) = ca_from_env("TRUSTED_GATEWAY_CA_FILE")? {
+            Arc::make_mut(&mut gateway).client = http_client(Some(&ca))?;
+        }
+        if let Some(mapping) = std::env::var_os("TRUSTED_GATEWAY_NAMESPACE_TOKEN_FILES") {
+            let mapping = mapping.into_string().map_err(|_| Error::InvalidContract)?;
+            gateway = gateway.with_registration_tokens(
+                serde_json::from_str(&mapping).map_err(|_| Error::InvalidContract)?,
+            )?;
+        }
         match std::env::var("TRUSTED_GATEWAY_ROUTER_ID") {
             Ok(id) => gateway.with_authorization(&id).map(Some),
             Err(std::env::VarError::NotPresent) => Ok(Some(gateway)),
             Err(_) => Err(Error::InvalidContract),
         }
+    }
+
+    /// Namespace readers for multi-tenant node registration. No root Fleet
+    /// credential is needed on the business gateway.
+    pub fn with_registration_tokens(
+        mut self: Arc<Self>,
+        mapping: std::collections::HashMap<String, PathBuf>,
+    ) -> Result<Arc<Self>> {
+        if mapping.len() > 1024
+            || mapping
+                .iter()
+                .any(|(namespace, path)| !label(namespace) || !path.is_absolute())
+        {
+            return Err(Error::InvalidContract);
+        }
+        Arc::make_mut(&mut self).namespace_tokens = mapping;
+        Ok(self)
     }
 
     pub fn with_authorization(mut self: Arc<Self>, router_id: &str) -> Result<Arc<Self>> {
@@ -326,6 +350,7 @@ impl Gateway {
         Router::new()
             .route("/v1/runtime/registration", post(registration))
             .route("/v1/runtime/connections", post(connections))
+            .route("/v1/runtime/probes", post(probes))
             .layer(DefaultBodyLimit::max(16384))
             .with_state(self)
     }
@@ -434,11 +459,33 @@ impl Gateway {
         fleet_token: &str,
         request: &ConnectionRequest,
     ) -> Result<Vec<Connection>> {
+        self.connections_for(fleet_token, request, Purpose::Access)
+            .await
+    }
+    pub async fn probes(
+        &self,
+        fleet_token: &str,
+        request: &ConnectionRequest,
+    ) -> Result<Vec<Connection>> {
+        self.connections_for(fleet_token, request, Purpose::Probe)
+            .await
+    }
+    async fn connections_for(
+        &self,
+        fleet_token: &str,
+        request: &ConnectionRequest,
+        purpose: Purpose,
+    ) -> Result<Vec<Connection>> {
+        if purpose == Purpose::Probe
+            && (request.http_request.is_some() || request.identity.is_some())
+        {
+            return Err(Error::InvalidContract);
+        }
         if let Some(binding) = &request.http_request {
             binding.validate()?;
         }
         let mut request = request.clone();
-        if request.service.service == "control" {
+        if purpose == Purpose::Probe || request.service.service == "control" {
             // Node administration is not granted by ordinary app read access.
             let mut response = self
                 .client
@@ -470,7 +517,10 @@ impl Gateway {
                 return Err(Error::Unauthorized);
             }
         }
-        if self.manages_identities() && request.service.service == "control" {
+        if purpose == Purpose::Access
+            && self.manages_identities()
+            && request.service.service == "control"
+        {
             // Preserve the operator path used by provisioners, after the admin
             // check above. Callers cannot choose another operator's identity.
             request.identity = Some(crate::authorization::AccessIdentity {
@@ -480,7 +530,11 @@ impl Gateway {
                 ))),
             });
         }
-        let binding = self.access_binding(fleet_token, &request).await?;
+        let binding = if purpose == Purpose::Access {
+            self.access_binding(fleet_token, &request).await?
+        } else {
+            None
+        };
         let mut output = Vec::new();
         for instance in self.instances(fleet_token, &request.service).await? {
             if request
@@ -493,12 +547,15 @@ impl Gateway {
             let mut grant = self.grant(
                 instance.execution,
                 request.service.clone(),
-                Purpose::Access,
+                purpose,
                 format!(
                     "fleet:{}",
                     hex::encode(Sha256::digest(fleet_token.as_bytes()))
                 ),
             );
+            if purpose == Purpose::Probe {
+                grant.exp = grant.nbf + 30;
+            }
             grant.http_request = request.http_request.clone();
             if let Some(expiry) = request.expires_at {
                 grant.exp = grant.exp.min(expiry);
@@ -562,8 +619,11 @@ impl Gateway {
         {
             return Err(Error::Unauthorized);
         }
-        let token = String::from_utf8(private_file(&self.registration_token_file)?)
-            .map_err(|_| Error::InvalidContract)?;
+        let path = self
+            .namespace_tokens
+            .get(&request.execution.namespace)
+            .unwrap_or(&self.registration_token_file);
+        let token = String::from_utf8(private_file(path)?).map_err(|_| Error::InvalidContract)?;
         if !self
             .instances(token.trim(), &request.service.id)
             .await?
@@ -619,4 +679,44 @@ async fn connections(
         .await
         .map(Json)
         .map_err(status)
+}
+
+async fn probes(
+    State(gateway): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    Json(request): Json<ConnectionRequest>,
+) -> std::result::Result<Json<Vec<Connection>>, StatusCode> {
+    gateway
+        .probes(bearer(&headers)?, &request)
+        .await
+        .map(Json)
+        .map_err(status)
+}
+
+pub(crate) fn http_client(ca: Option<&[u8]>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10));
+    if let Some(ca) = ca {
+        builder = builder.add_root_certificate(
+            reqwest::Certificate::from_pem(ca).map_err(|_| Error::InvalidContract)?,
+        );
+    }
+    builder.build().map_err(|_| Error::Unavailable)
+}
+
+pub(crate) fn ca_from_env(name: &str) -> Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let Some(path) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let file = std::fs::File::open(path).map_err(|_| Error::InvalidContract)?;
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Error::InvalidContract)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(Error::InvalidContract);
+    }
+    Ok(Some(bytes))
 }
