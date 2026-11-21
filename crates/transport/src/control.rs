@@ -437,7 +437,7 @@ impl Gateway {
         if let Some(binding) = &request.http_request {
             binding.validate()?;
         }
-        let binding = self.access_binding(fleet_token, request).await?;
+        let mut request = request.clone();
         if request.service.service == "control" {
             // Node administration is not granted by ordinary app read access.
             let mut response = self
@@ -470,6 +470,17 @@ impl Gateway {
                 return Err(Error::Unauthorized);
             }
         }
+        if self.manages_identities() && request.service.service == "control" {
+            // Preserve the operator path used by provisioners, after the admin
+            // check above. Callers cannot choose another operator's identity.
+            request.identity = Some(crate::authorization::AccessIdentity {
+                principal: hex::encode(Sha256::digest(format!("fleet:operator:v1:{fleet_token}"))),
+                session: hex::encode(Sha256::digest(format!(
+                    "fleet:operator-session:v1:{fleet_token}"
+                ))),
+            });
+        }
+        let binding = self.access_binding(fleet_token, &request).await?;
         let mut output = Vec::new();
         for instance in self.instances(fleet_token, &request.service).await? {
             if request

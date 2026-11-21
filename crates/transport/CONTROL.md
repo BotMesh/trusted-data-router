@@ -90,7 +90,11 @@ user and verifies workload ownership, then calls `Gateway::connections` with
 An optional `expires_at` further bounds the 15-minute grant by the business
 credential's expiry. Fleet's `/routers/relay-a/authorize` checks the delegation
 namespace, revocations and current service policy before returning a binding to
-sign. Administrator credentials cannot act as delegated identities.
+sign. Administrator credentials cannot act as delegated application users. The
+reserved `control` service instead requires an administrator token plus its own
+enabled Fleet access policy. For this service the gateway derives opaque operator
+identity from the authenticated credential, preserving provisioner operations;
+namespace delegates cannot obtain `control` bindings.
 
 `POST /routers/relay-a/revoke-subject` accepts
 `{namespace, principal, session}`. A namespace delegate can revoke only its own

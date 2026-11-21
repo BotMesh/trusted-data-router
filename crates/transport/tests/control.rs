@@ -115,6 +115,21 @@ async fn control_uses_live_fleet_scope_and_binds_node_and_stateful_clients() {
     let request = json!({"service":service});
     let control_request =
         json!({"service":{"namespace":"film","workload":"comfy","service":"control"}});
+    let managed_control = serde_json::from_value(control_request.clone()).unwrap();
+    assert!(managed
+        .connections("film-user", &managed_control)
+        .await
+        .is_err());
+    let operator = managed
+        .connections("administrator", &managed_control)
+        .await
+        .unwrap();
+    assert!(Verifier::new(&pubkey, "test".into())
+        .unwrap()
+        .verify(&operator[0].token, Purpose::Access)
+        .unwrap()
+        .access
+        .is_some());
     for (token, expected) in [("film-user", 403), ("administrator", 200)] {
         assert_eq!(
             http.post(format!("{base}v1/runtime/connections"))
