@@ -20,7 +20,7 @@ use std::{
     net::SocketAddr,
     path::Path,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -41,37 +41,52 @@ use tokio_util::{
 type HttpResult = std::result::Result<Response, StatusCode>;
 type Open = oneshot::Sender<yamux::Stream>;
 
-struct Session {
+pub(crate) struct Session {
     grant: Grant,
     serial: u64,
     open: mpsc::Sender<Open>,
-    cancel: CancellationToken,
+    pub(crate) cancel: CancellationToken,
     slots: Arc<Semaphore>,
 }
-struct Directory {
-    db: Connection,
-    sessions: HashMap<String, Arc<Session>>,
+pub(crate) struct Directory {
+    pub(crate) db: Connection,
+    pub(crate) sessions: HashMap<String, Arc<Session>>,
+    pub(crate) control: Option<crate::sync::ManagedControl>,
 }
 pub struct Relay {
-    verifier: Verifier,
-    directory: Mutex<Directory>,
+    pub(crate) verifier: Verifier,
+    pub(crate) directory: Mutex<Directory>,
     serial: AtomicU64,
+    watchdog_started: AtomicBool,
 }
 
 impl Relay {
     pub fn new(verifier: Verifier, database: &Path) -> crate::Result<Arc<Self>> {
         let db = Connection::open(database).map_err(|_| crate::Error::Unavailable)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+            CREATE TABLE IF NOT EXISTS control(singleton INTEGER PRIMARY KEY CHECK(singleton=1), state TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS revoked(route TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS generations(slot TEXT PRIMARY KEY, generation INTEGER NOT NULL, route TEXT NOT NULL, policy TEXT NOT NULL);")
             .map_err(|_| crate::Error::Unavailable)?;
+        let control: Option<String> = db
+            .query_row("SELECT state FROM control WHERE singleton=1", [], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(|_| crate::Error::Unavailable)?;
+        let control = control
+            .map(|s| serde_json::from_str::<crate::sync::ManagedControl>(&s))
+            .transpose()
+            .map_err(|_| crate::Error::InvalidContract)?;
         Ok(Arc::new(Self {
             verifier,
             directory: Mutex::new(Directory {
                 db,
+                control,
                 sessions: HashMap::new(),
             }),
             serial: AtomicU64::new(1),
+            watchdog_started: AtomicBool::new(false),
         }))
     }
     pub fn router(self: Arc<Self>) -> Router {
@@ -82,6 +97,10 @@ impl Relay {
             .route("/v1/http/{route}/", any(http_proxy))
             .route("/v1/http/{route}/{*rest}", any(http_proxy))
             .route("/v1/revoke/{route}", delete(revoke))
+            .layer(axum::middleware::from_fn_with_state(
+                self.clone(),
+                watch_control,
+            ))
             .with_state(self)
     }
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> std::io::Result<()> {
@@ -132,10 +151,11 @@ impl Relay {
         Ok(grant)
     }
     fn session(&self, grant: &Grant) -> std::result::Result<Arc<Session>, StatusCode> {
-        let directory = self
+        let mut directory = self
             .directory
             .lock()
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        directory.check_control()?;
         let session = directory
             .sessions
             .get(&grant.route_id())
@@ -148,6 +168,29 @@ impl Relay {
         }
         Ok(session.clone())
     }
+}
+
+// Initialize on the first request, so embedded Router users receive the same
+// enforcement as serve(), and router construction needs no Tokio context.
+async fn watch_control(
+    State(relay): State<Arc<Relay>>,
+    req: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !relay.watchdog_started.swap(true, Ordering::AcqRel) {
+        let weak = Arc::downgrade(&relay);
+        tokio::spawn(async move {
+            loop {
+                let Some(relay) = weak.upgrade() else {
+                    break;
+                };
+                relay.expire_control();
+                drop(relay);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+    }
+    next.run(req).await
 }
 
 /// Browser traffic carries its scoped grant in a header. Never enable wildcard
@@ -244,6 +287,7 @@ async fn connect(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResul
             .directory
             .lock()
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        directory.check_control()?;
         let revoked: bool = directory
             .db
             .query_row(

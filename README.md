@@ -13,7 +13,8 @@ ClawUp / Film clients -> data router -> reverse tunnel -> local service
                          connector dials outward from the node
 
 Fleet -> local Ray / fleet-node -> trusted-shim -> runtime + connector
-Central gateway -> policy versions, access grants and cumulative authorization
+Data router -> Fleet control API (outbound sync, applied revision ACK)
+Central gateway -> access grants
 ```
 
 Business payloads do not pass through ClawUp backend, OpenShell gateway or Fleet

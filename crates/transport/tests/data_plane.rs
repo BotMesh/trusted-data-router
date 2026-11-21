@@ -74,6 +74,259 @@ async fn outbound_http_sse_websocket_auth_expiry_revocation_and_recovery() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn fleet_sync_revokes_live_streams_and_fails_closed_on_restart_and_outage() {
+    tokio::time::timeout(Duration::from_secs(15), managed_acceptance())
+        .await
+        .unwrap();
+}
+
+async fn managed_acceptance() {
+    use serde_json::{json, Value};
+    use std::{
+        os::unix::fs::PermissionsExt,
+        sync::{Arc, Mutex},
+    };
+    use trusted_router_transport::sync::ControlClient;
+    let temp = tempfile::tempdir().unwrap();
+    let key_path = temp.path().join("key");
+    let public_path = temp.path().join("public");
+    assert!(Command::new("openssl")
+        .args(["genpkey", "-algorithm", "ED25519", "-out"])
+        .arg(&key_path)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("openssl")
+        .arg("pkey")
+        .arg("-in")
+        .arg(&key_path)
+        .args(["-pubout", "-out"])
+        .arg(&public_path)
+        .status()
+        .unwrap()
+        .success());
+    let key = std::fs::read(&key_path).unwrap();
+    let public = std::fs::read(&public_path).unwrap();
+    let token_file = temp.path().join("router.token");
+    std::fs::write(&token_file, "router-only").unwrap();
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let epoch = "ab".repeat(16);
+    let response = Arc::new(Mutex::new(
+        json!({"router_id":"relay-a","issuer":"test-gateway","epoch":epoch,
+        "from_revision":0,"revision":0,"revoked_routes":[],"lease_seconds":30}),
+    ));
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let control = Router::new().route(
+        "/routers/relay-a/sync",
+        axum::routing::post({
+            let response = response.clone();
+            let requests = requests.clone();
+            move |headers: HeaderMap, axum::Json(request): axum::Json<Value>| {
+                let response = response.clone();
+                let requests = requests.clone();
+                async move {
+                    assert_eq!(headers["authorization"], "Bearer router-only");
+                    requests.lock().unwrap().push(request);
+                    axum::Json(response.lock().unwrap().clone())
+                }
+            }
+        }),
+    );
+    let control_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let control_url = format!("http://{}/", control_listener.local_addr().unwrap());
+    let control_task = tokio::spawn(async {
+        axum::serve(control_listener, control).await.unwrap();
+    });
+    let client = ControlClient::new(&control_url, "relay-a".into(), token_file.clone()).unwrap();
+    assert!(
+        ControlClient::new("http://example.com", "relay-a".into(), token_file.clone()).is_err()
+    );
+    assert!(ControlClient::new(&control_url, "../other".into(), token_file.clone()).is_err());
+    let verifier = Verifier::new(&public, "test-gateway".into()).unwrap();
+    let database = temp.path().join("relay.db");
+    let relay = Relay::new(verifier.clone(), &database).unwrap();
+    relay.bind_control(&client).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(relay.clone().serve(listener));
+    let (app, app_task) = application().await;
+    let grant = Grant {
+        iss: "test-gateway".into(),
+        aud: AUDIENCE.into(),
+        sub: "owner".into(),
+        nbf: grants::now(),
+        exp: grants::now() + 120,
+        purpose: Purpose::Register,
+        http_request: None,
+        execution: ExecutionIdentity {
+            namespace: "film".into(),
+            workload: "app".into(),
+            allocation_id: "one".into(),
+            lease_id: "first".into(),
+            generation: 1,
+            node_id: "nat-node".into(),
+        },
+        service: ServiceId {
+            namespace: "film".into(),
+            workload: "app".into(),
+            service: "http".into(),
+        },
+        policy: PolicyRef {
+            issuer: "gateway".into(),
+            policy_id: "network".into(),
+            version: 1,
+            sha256: "ab".repeat(32),
+        },
+    };
+    let http = reqwest::Client::new();
+    let signed = |g: &Grant, purpose| {
+        grants::sign(
+            &key,
+            &Grant {
+                purpose,
+                ..g.clone()
+            },
+        )
+        .unwrap()
+    };
+    let ready = |g: &Grant| {
+        http.get(format!("http://{addr}/v1/ready/{}", g.route_id()))
+            .bearer_auth(signed(g, Purpose::Access))
+    };
+    assert_eq!(ready(&grant).send().await.unwrap().status(), 503);
+    client.poll_once(&relay).await.unwrap();
+    assert_eq!(
+        requests.lock().unwrap()[0],
+        json!({"epoch":null,"after_revision":0,"applied_revision":null})
+    );
+    let stop = CancellationToken::new();
+    let start = |g: &Grant| {
+        let url = format!("ws://{addr}/v1/connect/{}", g.route_id());
+        let token = signed(g, Purpose::Register);
+        let stop = stop.clone();
+        tokio::spawn(async move { edge::connect(&url, &token, app, stop).await })
+    };
+    let connector = start(&grant);
+    for _ in 0..100 {
+        if ready(&grant).send().await.unwrap().status() == 204 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(ready(&grant).send().await.unwrap().status(), 204);
+    let mut stream = http
+        .get(format!("http://{addr}/v1/http/{}/events", grant.route_id()))
+        .header("x-trusted-access", signed(&grant, Purpose::Access))
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream();
+    assert!(stream.next().await.unwrap().is_ok());
+    response.lock().unwrap()["revision"] = json!(1);
+    response.lock().unwrap()["revoked_routes"] = json!([grant.route_id()]);
+    client.poll_once(&relay).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(Ok(_)) = stream.next().await {}
+    })
+    .await
+    .unwrap();
+    assert_ne!(ready(&grant).send().await.unwrap().status(), 204);
+    response.lock().unwrap()["from_revision"] = json!(1);
+    response.lock().unwrap()["revoked_routes"] = json!([]);
+    client.poll_once(&relay).await.unwrap();
+    assert_eq!(
+        requests.lock().unwrap().last().unwrap()["applied_revision"],
+        1
+    );
+    // Reopening SQLite starts unavailable, preserves all tombstones and refuses
+    // authority changes, even if deployment accidentally omits control config.
+    let recovered = Relay::new(verifier, &database).unwrap();
+    assert!(recovered.requires_control().unwrap());
+    recovered.bind_control(&client).unwrap();
+    let other = ControlClient::new(&control_url, "relay-b".into(), token_file).unwrap();
+    assert!(recovered.bind_control(&other).is_err());
+    client.poll_once(&recovered).await.unwrap();
+    assert_eq!(
+        requests.lock().unwrap().last().unwrap()["after_revision"],
+        1
+    );
+    let recovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let recovery_addr = recovery_listener.local_addr().unwrap();
+    // Use the embeddable Router API as well: it must enforce the same controls.
+    let recovery_task = tokio::spawn(async move {
+        axum::serve(recovery_listener, recovered.router())
+            .await
+            .unwrap();
+    });
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            edge::connect(
+                &format!("ws://{recovery_addr}/v1/connect/{}", grant.route_id()),
+                &signed(&grant, Purpose::Register),
+                app,
+                CancellationToken::new()
+            )
+        )
+        .await
+        .unwrap()
+        .is_err(),
+        "the persisted tombstone must reject registration after recovery"
+    );
+    recovery_task.abort();
+    // Invalid authority, rollback, gaps and malformed routes never advance the cursor.
+    let good = response.lock().unwrap().clone();
+    for (field, value) in [
+        ("epoch", json!("cd".repeat(16))),
+        ("revision", json!(0)),
+        ("from_revision", json!(2)),
+        ("issuer", json!("other")),
+        ("router_id", json!("other")),
+        ("lease_seconds", json!(31)),
+    ] {
+        response.lock().unwrap()[field] = value;
+        assert!(client.poll_once(&relay).await.is_err());
+        *response.lock().unwrap() = good.clone();
+    }
+    // A different exact execution can connect, but loses its active SSE and
+    // new access when Fleet is unreachable beyond the control lease.
+    response.lock().unwrap()["lease_seconds"] = json!(1);
+    client.poll_once(&relay).await.unwrap();
+    let mut next = grant.clone();
+    next.execution.generation = 2;
+    next.execution.lease_id = "second".into();
+    let next_connector = start(&next);
+    for _ in 0..100 {
+        if ready(&next).send().await.unwrap().status() == 204 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(ready(&next).send().await.unwrap().status(), 204);
+    let mut stream = http
+        .get(format!("http://{addr}/v1/http/{}/events", next.route_id()))
+        .header("x-trusted-access", signed(&next, Purpose::Access))
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream();
+    assert!(stream.next().await.unwrap().is_ok());
+    control_task.abort();
+    assert!(client.poll_once(&relay).await.is_err());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(Ok(_)) = stream.next().await {}
+    })
+    .await
+    .unwrap();
+    assert_eq!(ready(&next).send().await.unwrap().status(), 503);
+    stop.cancel();
+    connector.abort();
+    next_connector.abort();
+    task.abort();
+    app_task.abort();
+}
+
 async fn acceptance() {
     let temp = tempfile::tempdir().unwrap();
     let key_path = temp.path().join("private.pem");

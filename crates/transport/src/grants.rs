@@ -124,7 +124,7 @@ impl Grant {
 #[derive(Clone)]
 pub struct Verifier {
     key: DecodingKey,
-    issuer: String,
+    pub(crate) issuer: String,
 }
 impl Verifier {
     pub fn new(public_pem: &[u8], issuer: String) -> Result<Self> {

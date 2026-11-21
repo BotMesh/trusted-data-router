@@ -8,6 +8,7 @@ use trusted_router_transport::{
     edge,
     grants::{self, Grant, Verifier},
     relay::Relay,
+    sync::ControlClient,
 };
 
 fn file(path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -44,9 +45,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| s.trim().to_owned())
                 .collect();
-            Relay::new(verifier, database)?
-                .serve_with_origins(TcpListener::bind(&args[1]).await?, &origins)
-                .await?;
+            let relay = Relay::new(verifier, database)?;
+            let client = ControlClient::from_env()?;
+            if client.is_none() && relay.requires_control()? {
+                return Err("persisted managed relay requires Fleet control configuration".into());
+            }
+            let listener = TcpListener::bind(&args[1]).await?;
+            if let Some(client) = client {
+                relay.bind_control(&client)?;
+                tokio::select! {
+                    result = relay.clone().serve_with_origins(listener, &origins) => result?,
+                    _ = client.run(relay) => return Err("control synchronization stopped".into()),
+                }
+            } else {
+                relay.serve_with_origins(listener, &origins).await?;
+            }
         }
         Some("gateway") if args.len() == 2 => {
             // Standalone control service, or embed Gateway::router in a backend.

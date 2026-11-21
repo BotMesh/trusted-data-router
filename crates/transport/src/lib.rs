@@ -5,4 +5,5 @@ pub mod control;
 pub mod edge;
 pub mod grants;
 pub mod relay;
+pub mod sync;
 pub mod transport;
