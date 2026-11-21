@@ -55,14 +55,14 @@ async fn control_uses_live_fleet_scope_and_binds_node_and_stateful_clients() {
     let execution = json!({"namespace":"film", "workload":"comfy", "allocation_id":"comfy-0", "lease_id":"first", "generation":1,"node_id":"edge-a"});
     let view = Arc::new(Mutex::new(
         json!({"name":"comfy", "namespace":"film", "disabled":false,
-        "runtime_instances":[{"execution":execution,"ready":true,"services":["http"]}]}),
+        "runtime_instances":[{"execution":execution,"ready":true,"services":["http", "control"]}]}),
     ));
     async fn app(
         State(view): State<Arc<Mutex<Value>>>,
         headers: HeaderMap,
     ) -> Result<Json<Value>, StatusCode> {
         match headers.get("authorization").and_then(|h| h.to_str().ok()) {
-            Some("Bearer film-user" | "Bearer registration-reader") => {
+            Some("Bearer film-user" | "Bearer registration-reader" | "Bearer administrator") => {
                 Ok(Json(view.lock().unwrap().clone()))
             }
             _ => Err(StatusCode::FORBIDDEN),
@@ -70,6 +70,7 @@ async fn control_uses_live_fleet_scope_and_binds_node_and_stateful_clients() {
     }
     let (fleet, fleet_task) = listen(
         Router::new()
+            .route("/access", get(|headers: HeaderMap| async move { Json(json!({"permissions":if headers.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer administrator") {vec!["admin"]} else {vec!["read"]}})) }))
             .route("/apps/comfy", get(app))
             .with_state(view.clone()),
     )
@@ -87,6 +88,21 @@ async fn control_uses_live_fleet_scope_and_binds_node_and_stateful_clients() {
     let http = reqwest::Client::new();
     let service = json!({"namespace":"film","workload":"comfy","service":"http"});
     let request = json!({"service":service});
+    let control_request =
+        json!({"service":{"namespace":"film","workload":"comfy","service":"control"}});
+    for (token, expected) in [("film-user", 403), ("administrator", 200)] {
+        assert_eq!(
+            http.post(format!("{base}v1/runtime/connections"))
+                .bearer_auth(token)
+                .json(&control_request)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            expected
+        );
+    }
+
     let access = || {
         http.post(format!("{base}v1/runtime/connections"))
             .bearer_auth("film-user")

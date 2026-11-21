@@ -318,6 +318,38 @@ impl Gateway {
         fleet_token: &str,
         request: &ConnectionRequest,
     ) -> Result<Vec<Connection>> {
+        if request.service.service == "control" {
+            // Node administration is not granted by ordinary app read access.
+            let mut response = self
+                .client
+                .get(
+                    self.fleet
+                        .join("access")
+                        .map_err(|_| Error::InvalidContract)?,
+                )
+                .bearer_auth(fleet_token)
+                .send()
+                .await
+                .map_err(|_| Error::Unavailable)?;
+            if !response.status().is_success() {
+                return Err(Error::Unauthorized);
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| Error::Unavailable)? {
+                if bytes.len() + chunk.len() > 65536 {
+                    return Err(Error::Unavailable);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let access: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|_| Error::Unavailable)?;
+            if !access["permissions"]
+                .as_array()
+                .is_some_and(|p| p.iter().any(|v| v == "admin"))
+            {
+                return Err(Error::Unauthorized);
+            }
+        }
         let mut output = Vec::new();
         for instance in self.instances(fleet_token, &request.service).await? {
             if request
@@ -360,7 +392,12 @@ impl Gateway {
             || !node.namespaces.contains(&request.execution.namespace)
             || request.service.id.namespace != request.execution.namespace
             || request.service.id.workload != request.execution.workload
-            || request.service.endpoint_ref != "app"
+            || !(request.service.endpoint_ref == "app" && request.service.id.service != "control"
+                || request.service.endpoint_ref == "control"
+                    && request.service.id.service == "control"
+                || request.service.id.service != "control"
+                    && request.service.endpoint_ref
+                        == format!("ingress:{}", request.service.id.service))
         {
             return Err(Error::Unauthorized);
         }

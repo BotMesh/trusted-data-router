@@ -446,6 +446,11 @@ fn strip_hop(headers: &mut HeaderMap, websocket: bool) {
 
 async fn http_proxy(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResult {
     let grant = relay.authenticate(&req, Purpose::Access)?;
+    let capability = req
+        .headers()
+        .get("x-trusted-access")
+        .cloned()
+        .ok_or(StatusCode::UNAUTHORIZED)?;
     let session = relay.session(&grant)?;
     let slot = Arc::new(
         session
@@ -473,6 +478,9 @@ async fn http_proxy(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpRe
     );
     *req.uri_mut() = path.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
     strip_hop(req.headers_mut(), websocket);
+    // A local shim ingress verifies the exact signed execution before injecting
+    // native app credentials. Never trust the client's copy of this header.
+    req.headers_mut().insert("x-trusted-route", capability);
     req.headers_mut()
         .insert("host", "localhost".parse().unwrap());
     let (mut sender, connection) =
