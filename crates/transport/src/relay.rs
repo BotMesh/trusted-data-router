@@ -78,6 +78,7 @@ impl Relay {
         Router::new()
             .route("/v1/connect/{route}", get(connect))
             .route("/v1/tunnel/{route}", get(tunnel))
+            .route("/v1/ready/{route}", get(ready))
             .route("/v1/http/{route}/", any(http_proxy))
             .route("/v1/http/{route}/{*rest}", any(http_proxy))
             .route("/v1/revoke/{route}", delete(revoke))
@@ -367,6 +368,20 @@ async fn open(session: &Session) -> std::result::Result<yamux::Stream, StatusCod
 }
 pub(crate) async fn expires(exp: u64) {
     tokio::time::sleep(Duration::from_secs(exp.saturating_sub(grants::now()))).await;
+}
+
+/// Observe the exact route without sending application bytes or consuming an
+/// HTTP invocation. Availability is advisory; mutations still must not replay.
+async fn ready(State(relay): State<Arc<Relay>>, req: Request) -> HttpResult {
+    let grant = relay.authenticate(&req, Purpose::Access)?;
+    let session = relay.session(&grant)?;
+    if session.open.is_closed() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn tunnel(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResult {

@@ -162,6 +162,18 @@ async fn acceptance() {
     let address = listener.local_addr().unwrap();
     let relay_task = tokio::spawn(relay.serve(listener));
     let (app, app_task) = application().await;
+    let http = reqwest::Client::new();
+    let ready_url = format!("http://{address}/v1/ready/{route}");
+    assert_eq!(http.get(&ready_url).send().await.unwrap().status(), 401);
+    assert_eq!(
+        http.get(&ready_url)
+            .bearer_auth(&bound_access)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
     let stop = CancellationToken::new();
     let connector_url = format!("ws://{address}/v1/connect/{route}");
     let connector = tokio::spawn({
@@ -186,6 +198,24 @@ async fn acceptance() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert_eq!(
+        http.get(&ready_url)
+            .bearer_auth(&bound_access)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    assert_eq!(
+        http.get(&ready_url)
+            .bearer_auth(&register)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
     for (method, path) in [
         (reqwest::Method::GET, "/echo"),
         (reqwest::Method::POST, "/different"),
@@ -367,6 +397,15 @@ async fn acceptance() {
     .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     let stop2 = CancellationToken::new();
+    assert_eq!(
+        http.get(&ready_url)
+            .bearer_auth(&bound_access)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        503
+    );
     let connector2 = tokio::spawn({
         let url = connector_url.clone();
         let token = register.clone();

@@ -393,6 +393,28 @@ impl Gateway {
         }
         Ok(output)
     }
+    /// Fleet readiness and relay registration are independent observations.
+    /// This reads the relay's authenticated route state without dispatching the
+    /// application request. Call before returning a newly prepared mutation.
+    pub async fn ready(&self, connection: &Connection) -> Result<bool> {
+        if connection.base_url != format!("{}v1/http/{}", self.relay, connection.route_id) {
+            return Err(Error::InvalidContract);
+        }
+        let response = self
+            .client
+            .get(
+                self.relay
+                    .join(&format!("v1/ready/{}", connection.route_id))
+                    .map_err(|_| Error::InvalidContract)?,
+            )
+            .bearer_auth(&connection.token)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        Ok(response.status() == reqwest::StatusCode::NO_CONTENT)
+    }
+
     async fn register(&self, token: &str, request: &Registration) -> Result<String> {
         let node = self.node(token)?;
         if node.sub != request.execution.node_id

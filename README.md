@@ -162,3 +162,11 @@ The local test creates ephemeral Ed25519 keys with `openssl`; no production
 credentials, remote cluster or local prover is used.
 
 The optional [central connection gateway](crates/transport/CONTROL.md) embeds in an application's backend and issues grants only after checking Fleet's live runtime discovery and caller scope. It uses the same transport crate; no second runtime catalog is introduced.
+
+Before dispatching a one-shot HTTP mutation, clients can check
+`GET /v1/ready/{route_id}` with `Authorization: Bearer <access token>`.
+The relay returns 204 only while the exact route is connected. This check sends
+no application bytes and does not consume a request-bound grant. Fleet health
+and relay registration can become ready at different times after a restart.
+`Gateway::ready` exposes this check to embedding applications. Availability can
+still change after the check; never automatically replay an ambiguous mutation.
