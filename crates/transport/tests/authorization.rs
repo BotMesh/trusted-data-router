@@ -157,6 +157,31 @@ async fn acceptance() {
     let mut rules: trusted_router_transport::authorization::AuthorizationState =
         serde_json::from_value(response.lock().unwrap()["authorization"].clone()).unwrap();
     assert!(rules.allows(&first));
+    // Application sessions and operator control have separate revocation scopes.
+    let mut control = first.clone();
+    control.service.service = "control".into();
+    let mut control_rules = rules.clone();
+    control_rules.policies[0].service = "control".into();
+    assert!(
+        !control_rules.allows(&control),
+        "control never inherits a wildcard"
+    );
+    control_rules.policies[0].workload = "app".into();
+    control_rules.policies.push(rules.policies[0].clone());
+    assert!(control_rules.allows(&control));
+    control_rules.revoked_subjects.push(
+        serde_json::from_value(json!({
+            "namespace":ns,"principal":first.sub,"session":null,"application_only":true
+        }))
+        .unwrap(),
+    );
+    assert!(!control_rules.allows(&first));
+    assert!(control_rules.allows(&control));
+    control_rules.revoked_subjects[0].application_only = None;
+    assert!(
+        !control_rules.allows(&control),
+        "operator revocation covers control"
+    );
     let mut exact = rules.policies[0].clone();
     exact.workload = "app".into();
     exact.enabled = false;

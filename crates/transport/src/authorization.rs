@@ -55,6 +55,8 @@ pub struct SubjectRevocation {
     pub namespace: String,
     pub principal: String,
     pub session: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_only: Option<bool>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -96,7 +98,12 @@ impl AuthorizationState {
             if !namespace(&s.namespace)
                 || !valid_route(&s.principal)
                 || s.session.as_ref().is_some_and(|s| !valid_route(s))
-                || !subjects.insert((&s.namespace, &s.principal, &s.session))
+                || !subjects.insert((
+                    &s.namespace,
+                    &s.principal,
+                    &s.session,
+                    s.application_only == Some(true),
+                ))
             {
                 return Err(Error::InvalidContract);
             }
@@ -128,6 +135,7 @@ impl AuthorizationState {
         };
         !self.revoked_subjects.iter().any(|r| {
             r.namespace == grant.execution.namespace
+                && (grant.service.service != "control" || r.application_only != Some(true))
                 && r.principal == binding.principal
                 && r.session.as_ref().is_none_or(|s| s == &binding.session)
         }) && {
@@ -142,7 +150,7 @@ impl AuthorizationState {
                     self.policies
                         .iter()
                         .filter(scoped)
-                        .find(|p| p.workload == "*")
+                        .find(|p| p.workload == "*" && grant.service.service != "control")
                 })
                 .is_some_and(|p| {
                     p.enabled

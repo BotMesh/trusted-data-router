@@ -321,7 +321,10 @@ impl ControlClient {
             .bearer_auth(token.trim())
             // Older Fleet versions ignore this header and keep accepting the
             // unchanged JSON request. New Fleet gates default policies on it.
-            .header("x-fleet-router-capabilities", "workload-defaults-v1")
+            .header(
+                "x-fleet-router-capabilities",
+                "workload-defaults-v1,scoped-revocations-v1",
+            )
             .json(&request)
             .send()
             .await

@@ -343,7 +343,7 @@ async fn managed_acceptance() {
                     assert_eq!(headers["authorization"], "Bearer router-only");
                     assert_eq!(
                         headers["x-fleet-router-capabilities"],
-                        "workload-defaults-v1"
+                        "workload-defaults-v1,scoped-revocations-v1"
                     );
                     // Legacy schedulers still accept the closed JSON shape.
                     serde_json::from_value::<trusted_router_transport::sync::SyncRequest>(
