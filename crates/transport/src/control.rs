@@ -10,7 +10,7 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -24,6 +24,10 @@ use trusted_data_router::ServiceSpec;
 const NODE_AUDIENCE: &str = "trusted-runtime-node/v1";
 const NODE_LIFETIME: u64 = 30 * 86400;
 const GRANT_LIFETIME: u64 = 900;
+/// A renewable node transport lease, independent of application Access expiry.
+/// Fleet readiness must be rechecked before each renewal. Existing streams are
+/// drained by the relay at expiry even if the node stops contacting the gateway.
+pub const REGISTRATION_LIFETIME: u64 = 30;
 
 /// An operator enrolls a node after verifying its Fleet identity. This is a
 /// bootstrap credential, not a TEE attestation. Keep it outside the workload.
@@ -68,16 +72,7 @@ pub fn enroll_node(private_key: &[u8], credential: &NodeCredential) -> Result<St
 }
 
 pub fn private_file(path: &Path) -> Result<Vec<u8>> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::symlink_metadata(path).map_err(|_| Error::Unavailable)?;
-    if !path.is_absolute()
-        || !meta.is_file()
-        || meta.permissions().mode() & 0o077 != 0
-        || meta.len() > 16384
-    {
-        return Err(Error::InvalidContract);
-    }
-    std::fs::read(path).map_err(|_| Error::Unavailable)
+    crate::keys::read_file(path, true)
 }
 
 fn root(value: &str) -> Result<reqwest::Url> {
@@ -101,9 +96,12 @@ pub struct Gateway {
     relay: reqwest::Url,
     issuer: String,
     signing_key: Vec<u8>,
-    node_key: DecodingKey,
+    signing_key_file: Option<PathBuf>,
+    node_keys: crate::keys::VerificationKeys,
     registration_token_file: PathBuf,
+    namespace_tokens: std::collections::HashMap<String, PathBuf>,
     client: reqwest::Client,
+    authorization_router: Option<String>,
 }
 #[derive(Deserialize)]
 struct AppView {
@@ -128,6 +126,13 @@ pub struct ConnectionRequest {
     pub execution: Option<ExecutionIdentity>,
     /// Stable opaque address saved by clients; never resolves to a replacement.
     pub route_id: Option<String>,
+    #[serde(default)]
+    pub http_request: Option<grants::HttpRequestBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::authorization::AccessIdentity>,
+    /// A backend can shorten a grant to the remaining authenticated session life.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -158,7 +163,7 @@ impl Gateway {
         if !label(&issuer) {
             return Err(Error::InvalidContract);
         }
-        let node_key = DecodingKey::from_ed_pem(public_key).map_err(|_| Error::InvalidContract)?;
+        let node_keys = crate::keys::VerificationKeys::new(public_key)?;
         // Reject mismatched key pairs at startup, rather than issuing unusable grants.
         let probe = NodeCredential {
             iss: issuer.clone(),
@@ -171,21 +176,54 @@ impl Gateway {
         let token = enroll_node(private_key, &probe)?;
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.set_audience(&[NODE_AUDIENCE]);
-        jsonwebtoken::decode::<NodeCredential>(&token, &node_key, &validation)
+        node_keys
+            .decode::<NodeCredential>(&token, &validation)
             .map_err(|_| Error::InvalidContract)?;
         Ok(Arc::new(Self {
             fleet: root(fleet_url)?,
             relay: root(relay_url)?,
             issuer,
             signing_key: private_key.into(),
-            node_key,
+            signing_key_file: None,
+            node_keys,
             registration_token_file,
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_secs(10))
-                .build()
-                .map_err(|_| Error::Unavailable)?,
+            namespace_tokens: Default::default(),
+            authorization_router: None,
+            client: http_client(None)?,
         }))
+    }
+
+    /// Keep the existing paths live so an operator can stage overlapping public
+    /// keys and switch the signer without restarting embedded gateways.
+    pub fn with_key_files(
+        mut self: Arc<Self>,
+        private: PathBuf,
+        public: PathBuf,
+    ) -> Result<Arc<Self>> {
+        let gateway = Arc::make_mut(&mut self);
+        gateway.node_keys = crate::keys::VerificationKeys::file(public)?;
+        gateway.signing_key_file = Some(private);
+        gateway.checked_signing_key()?;
+        gateway.signing_key.clear();
+        Ok(self)
+    }
+
+    fn checked_signing_key(&self) -> Result<Vec<u8>> {
+        let key = match &self.signing_key_file {
+            Some(path) => private_file(path)?,
+            None => self.signing_key.clone(),
+        };
+        let probe = NodeCredential {
+            iss: self.issuer.clone(),
+            aud: NODE_AUDIENCE.into(),
+            sub: "key-check".into(),
+            namespaces: vec!["key-check".into()],
+            nbf: grants::now(),
+            exp: grants::now() + 60,
+        };
+        let token = enroll_node(&key, &probe)?;
+        self.node(&token)?;
+        Ok(key)
     }
 
     /// Optional central-backend integration, using its existing environment.
@@ -195,23 +233,157 @@ impl Gateway {
             return Ok(None);
         };
         let value = |name| std::env::var(name).map_err(|_| Error::InvalidContract);
-        let key = private_file(Path::new(&value("TRUSTED_GATEWAY_SIGNING_KEY_FILE")?))?;
-        let public = std::fs::read(value("TRUSTED_GATEWAY_PUBLIC_KEY_FILE")?)
-            .map_err(|_| Error::Unavailable)?;
-        Self::new(
+        let key_path = PathBuf::from(value("TRUSTED_GATEWAY_SIGNING_KEY_FILE")?);
+        let public_path = PathBuf::from(value("TRUSTED_GATEWAY_PUBLIC_KEY_FILE")?);
+        let key = private_file(&key_path)?;
+        let public = crate::keys::read_file(&public_path, false)?;
+        let mut gateway = Self::new(
             &fleet,
             &value("TRUSTED_GATEWAY_RELAY_URL")?,
             value("TRUSTED_GATEWAY_ISSUER")?,
             &key,
             &public,
             value("TRUSTED_GATEWAY_FLEET_TOKEN_FILE")?.into(),
+        )?
+        .with_key_files(key_path, public_path)?;
+        if let Some(ca) = ca_from_env("TRUSTED_GATEWAY_CA_FILE")? {
+            Arc::make_mut(&mut gateway).client = http_client(Some(&ca))?;
+        }
+        if let Some(mapping) = std::env::var_os("TRUSTED_GATEWAY_NAMESPACE_TOKEN_FILES") {
+            let mapping = mapping.into_string().map_err(|_| Error::InvalidContract)?;
+            gateway = gateway.with_registration_tokens(
+                serde_json::from_str(&mapping).map_err(|_| Error::InvalidContract)?,
+            )?;
+        }
+        match std::env::var("TRUSTED_GATEWAY_ROUTER_ID") {
+            Ok(id) => gateway.with_authorization(&id).map(Some),
+            Err(std::env::VarError::NotPresent) => Ok(Some(gateway)),
+            Err(_) => Err(Error::InvalidContract),
+        }
+    }
+
+    /// Namespace readers for multi-tenant node registration. No root Fleet
+    /// credential is needed on the business gateway.
+    pub fn with_registration_tokens(
+        mut self: Arc<Self>,
+        mapping: std::collections::HashMap<String, PathBuf>,
+    ) -> Result<Arc<Self>> {
+        if mapping.len() > 1024
+            || mapping
+                .iter()
+                .any(|(namespace, path)| !label(namespace) || !path.is_absolute())
+        {
+            return Err(Error::InvalidContract);
+        }
+        Arc::make_mut(&mut self).namespace_tokens = mapping;
+        Ok(self)
+    }
+
+    pub fn with_authorization(mut self: Arc<Self>, router_id: &str) -> Result<Arc<Self>> {
+        if !crate::sync::valid_id(router_id) {
+            return Err(Error::InvalidContract);
+        }
+        Arc::make_mut(&mut self).authorization_router = Some(router_id.into());
+        Ok(self)
+    }
+    pub fn manages_identities(&self) -> bool {
+        self.authorization_router.is_some()
+    }
+
+    async fn fleet_json(&self, request: reqwest::RequestBuilder) -> Result<serde_json::Value> {
+        let mut response = request.send().await.map_err(|_| Error::Unavailable)?;
+        if !response.status().is_success() {
+            return Err(if matches!(response.status().as_u16(), 401 | 403 | 404) {
+                Error::Unauthorized
+            } else {
+                Error::Unavailable
+            });
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| Error::Unavailable)? {
+            if bytes.len() + chunk.len() > 1024 * 1024 {
+                return Err(Error::Unavailable);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| Error::Unavailable)
+    }
+    async fn access_binding(
+        &self,
+        token: &str,
+        request: &ConnectionRequest,
+    ) -> Result<Option<crate::authorization::AccessBinding>> {
+        let Some(router) = &self.authorization_router else {
+            return if request.identity.is_none() {
+                Ok(None)
+            } else {
+                Err(Error::InvalidContract)
+            };
+        };
+        let identity = request.identity.as_ref().ok_or(Error::Unauthorized)?;
+        identity.validate()?;
+        let url = self
+            .fleet
+            .join(&format!("routers/{router}/authorize"))
+            .map_err(|_| Error::InvalidContract)?;
+        let binding: crate::authorization::AccessBinding = serde_json::from_value(self.fleet_json(self.client.post(url).bearer_auth(token)
+            .json(&serde_json::json!({"namespace":request.service.namespace,"workload":request.service.workload,"service":request.service.service,
+                "principal":identity.principal,"session":identity.session}))).await?).map_err(|_| Error::Unavailable)?;
+        binding.validate()?;
+        if binding.principal != identity.principal || binding.session != identity.session {
+            return Err(Error::Unauthorized);
+        }
+        Ok(Some(binding))
+    }
+    /// A namespace-wide backend delegation credential revokes only its own
+    /// identities. Raw user credentials never cross into Fleet or the relay.
+    pub async fn revoke_identity(
+        &self,
+        token: &str,
+        identity: &crate::authorization::AccessIdentity,
+    ) -> Result<()> {
+        identity.validate()?;
+        let router = self
+            .authorization_router
+            .as_ref()
+            .ok_or(Error::InvalidContract)?;
+        let access = self
+            .fleet_json(
+                self.client
+                    .get(
+                        self.fleet
+                            .join("access")
+                            .map_err(|_| Error::InvalidContract)?,
+                    )
+                    .bearer_auth(token),
+            )
+            .await?;
+        let namespace = access["namespace"].as_str().ok_or(Error::Unauthorized)?;
+        if !access["permissions"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|v| v == "router_delegate"))
+        {
+            return Err(Error::Unauthorized);
+        }
+        let url = self
+            .fleet
+            .join(&format!("routers/{router}/revoke-subject"))
+            .map_err(|_| Error::InvalidContract)?;
+        self.fleet_json(
+            self.client
+                .post(url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({"namespace":namespace,
+            "principal":identity.principal,"session":identity.session})),
         )
-        .map(Some)
+        .await?;
+        Ok(())
     }
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
             .route("/v1/runtime/registration", post(registration))
             .route("/v1/runtime/connections", post(connections))
+            .route("/v1/runtime/probes", post(probes))
             .layer(DefaultBodyLimit::max(16384))
             .with_state(self)
     }
@@ -224,9 +396,7 @@ impl Gateway {
         validation.set_issuer(&[&self.issuer]);
         validation.leeway = 0;
         validation.validate_nbf = true;
-        let claims = jsonwebtoken::decode::<NodeCredential>(token, &self.node_key, &validation)
-            .map_err(|_| Error::Unauthorized)?
-            .claims;
+        let claims: NodeCredential = self.node_keys.decode(token, &validation)?;
         claims.validate()?;
         Ok(claims)
     }
@@ -300,6 +470,8 @@ impl Gateway {
             nbf: grants::now(),
             exp: grants::now() + GRANT_LIFETIME,
             purpose,
+            http_request: None,
+            access: None,
             execution,
             service,
             policy: PolicyRef {
@@ -318,7 +490,33 @@ impl Gateway {
         fleet_token: &str,
         request: &ConnectionRequest,
     ) -> Result<Vec<Connection>> {
-        if request.service.service == "control" {
+        self.connections_for(fleet_token, request, Purpose::Access)
+            .await
+    }
+    pub async fn probes(
+        &self,
+        fleet_token: &str,
+        request: &ConnectionRequest,
+    ) -> Result<Vec<Connection>> {
+        self.connections_for(fleet_token, request, Purpose::Probe)
+            .await
+    }
+    async fn connections_for(
+        &self,
+        fleet_token: &str,
+        request: &ConnectionRequest,
+        purpose: Purpose,
+    ) -> Result<Vec<Connection>> {
+        if purpose == Purpose::Probe
+            && (request.http_request.is_some() || request.identity.is_some())
+        {
+            return Err(Error::InvalidContract);
+        }
+        if let Some(binding) = &request.http_request {
+            binding.validate()?;
+        }
+        let mut request = request.clone();
+        if purpose == Purpose::Probe || request.service.service == "control" {
             // Node administration is not granted by ordinary app read access.
             let mut response = self
                 .client
@@ -350,6 +548,24 @@ impl Gateway {
                 return Err(Error::Unauthorized);
             }
         }
+        if purpose == Purpose::Access
+            && self.manages_identities()
+            && request.service.service == "control"
+        {
+            // Preserve the operator path used by provisioners, after the admin
+            // check above. Callers cannot choose another operator's identity.
+            request.identity = Some(crate::authorization::AccessIdentity {
+                principal: hex::encode(Sha256::digest(format!("fleet:operator:v1:{fleet_token}"))),
+                session: hex::encode(Sha256::digest(format!(
+                    "fleet:operator-session:v1:{fleet_token}"
+                ))),
+            });
+        }
+        let binding = if purpose == Purpose::Access {
+            self.access_binding(fleet_token, &request).await?
+        } else {
+            None
+        };
         let mut output = Vec::new();
         for instance in self.instances(fleet_token, &request.service).await? {
             if request
@@ -359,15 +575,26 @@ impl Gateway {
             {
                 continue;
             }
-            let grant = self.grant(
+            let mut grant = self.grant(
                 instance.execution,
                 request.service.clone(),
-                Purpose::Access,
+                purpose,
                 format!(
                     "fleet:{}",
                     hex::encode(Sha256::digest(fleet_token.as_bytes()))
                 ),
             );
+            if purpose == Purpose::Probe {
+                grant.exp = grant.nbf + 30;
+            }
+            grant.http_request = request.http_request.clone();
+            if let Some(expiry) = request.expires_at {
+                grant.exp = grant.exp.min(expiry);
+            }
+            if let Some(binding) = &binding {
+                grant.sub = binding.principal.clone();
+                grant.access = Some(binding.clone());
+            }
             let route_id = grant.route_id();
             if request.route_id.as_ref().is_some_and(|r| r != &route_id) {
                 continue;
@@ -377,7 +604,7 @@ impl Gateway {
                 service: grant.service.clone(),
                 base_url: format!("{}v1/http/{}", self.relay, route_id),
                 route_id,
-                token: grants::sign(&self.signing_key, &grant)?,
+                token: grants::sign(&self.checked_signing_key()?, &grant)?,
                 expires_at: grant.exp,
             });
         }
@@ -386,6 +613,28 @@ impl Gateway {
         }
         Ok(output)
     }
+    /// Fleet readiness and relay registration are independent observations.
+    /// This reads the relay's authenticated route state without dispatching the
+    /// application request. Call before returning a newly prepared mutation.
+    pub async fn ready(&self, connection: &Connection) -> Result<bool> {
+        if connection.base_url != format!("{}v1/http/{}", self.relay, connection.route_id) {
+            return Err(Error::InvalidContract);
+        }
+        let response = self
+            .client
+            .get(
+                self.relay
+                    .join(&format!("v1/ready/{}", connection.route_id))
+                    .map_err(|_| Error::InvalidContract)?,
+            )
+            .bearer_auth(&connection.token)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        Ok(response.status() == reqwest::StatusCode::NO_CONTENT)
+    }
+
     async fn register(&self, token: &str, request: &Registration) -> Result<String> {
         let node = self.node(token)?;
         if node.sub != request.execution.node_id
@@ -401,8 +650,14 @@ impl Gateway {
         {
             return Err(Error::Unauthorized);
         }
-        let token = String::from_utf8(private_file(&self.registration_token_file)?)
-            .map_err(|_| Error::InvalidContract)?;
+        let path = self
+            .namespace_tokens
+            .get(&request.execution.namespace)
+            .unwrap_or(&self.registration_token_file);
+        let token = String::from_utf8(private_file(path)?).map_err(|_| Error::InvalidContract)?;
+        // Include the Fleet round trip in the lease, so a delayed readiness
+        // response cannot buy a fresh full lease after authority has been lost.
+        let checked_at = grants::now();
         if !self
             .instances(token.trim(), &request.service.id)
             .await?
@@ -411,15 +666,15 @@ impl Gateway {
         {
             return Err(Error::Unauthorized);
         }
-        grants::sign(
-            &self.signing_key,
-            &self.grant(
-                request.execution.clone(),
-                request.service.id.clone(),
-                Purpose::Register,
-                node.sub,
-            ),
-        )
+        let mut grant = self.grant(
+            request.execution.clone(),
+            request.service.id.clone(),
+            Purpose::Register,
+            node.sub,
+        );
+        grant.nbf = checked_at;
+        grant.exp = checked_at + REGISTRATION_LIFETIME;
+        grants::sign(&self.checked_signing_key()?, &grant)
     }
 }
 
@@ -458,4 +713,44 @@ async fn connections(
         .await
         .map(Json)
         .map_err(status)
+}
+
+async fn probes(
+    State(gateway): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    Json(request): Json<ConnectionRequest>,
+) -> std::result::Result<Json<Vec<Connection>>, StatusCode> {
+    gateway
+        .probes(bearer(&headers)?, &request)
+        .await
+        .map(Json)
+        .map_err(status)
+}
+
+pub(crate) fn http_client(ca: Option<&[u8]>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10));
+    if let Some(ca) = ca {
+        builder = builder.add_root_certificate(
+            reqwest::Certificate::from_pem(ca).map_err(|_| Error::InvalidContract)?,
+        );
+    }
+    builder.build().map_err(|_| Error::Unavailable)
+}
+
+pub(crate) fn ca_from_env(name: &str) -> Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let Some(path) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let file = std::fs::File::open(path).map_err(|_| Error::InvalidContract)?;
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Error::InvalidContract)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(Error::InvalidContract);
+    }
+    Ok(Some(bytes))
 }
