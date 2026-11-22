@@ -4,10 +4,18 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
+    serve::ListenerExt,
     Router,
 };
 use futures::{SinkExt, StreamExt};
-use std::{process::Command, time::Duration};
+use std::{
+    process::Command,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use trusted_contracts::{ExecutionIdentity, PolicyRef, ServiceId};
@@ -17,7 +25,11 @@ use trusted_router_transport::{
     relay::Relay,
 };
 
-async fn application() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+async fn application() -> (
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<()>,
+    Arc<AtomicUsize>,
+) {
     async fn echo(headers: HeaderMap) -> Response {
         assert!(!headers.contains_key("x-trusted-access"));
         (
@@ -53,9 +65,13 @@ async fn application() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let counter = accepts.clone();
     let task = tokio::spawn(async move {
         axum::serve(
-            listener,
+            listener.tap_io(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
             Router::new()
                 .route("/echo", get(echo))
                 .route("/events", get(events))
@@ -64,7 +80,7 @@ async fn application() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         .await
         .unwrap();
     });
-    (address, task)
+    (address, task, accepts)
 }
 
 #[tokio::test]
@@ -103,7 +119,7 @@ async fn registration_renewal_preserves_streams_without_extending_access_or_revi
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let relay_task = tokio::spawn(relay.serve(listener));
-    let (app, app_task) = application().await;
+    let (app, app_task, _) = application().await;
     let start = grants::now();
     let register = Grant {
         iss: "renewal-test".into(),
@@ -374,7 +390,7 @@ async fn managed_acceptance() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let task = tokio::spawn(relay.clone().serve(listener));
-    let (app, app_task) = application().await;
+    let (app, app_task, _) = application().await;
     let grant = Grant {
         iss: "test-gateway".into(),
         aud: AUDIENCE.into(),
@@ -640,7 +656,7 @@ async fn acceptance() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let relay_task = tokio::spawn(relay.serve(listener));
-    let (app, app_task) = application().await;
+    let (app, app_task, accepts) = application().await;
     let http = reqwest::Client::new();
     let ready_url = format!("http://{address}/v1/ready/{route}");
     assert_eq!(http.get(&ready_url).send().await.unwrap().status(), 401);
@@ -695,6 +711,11 @@ async fn acceptance() {
             .status(),
         401
     );
+    let before_invalid = accepts.load(Ordering::SeqCst);
+    assert!(
+        before_invalid > 0,
+        "valid requests must reach the local target"
+    );
     for (method, path) in [
         (reqwest::Method::GET, "/echo"),
         (reqwest::Method::POST, "/different"),
@@ -710,6 +731,24 @@ async fn acceptance() {
             403
         );
     }
+    assert_eq!(
+        http.post(format!("{base}/echo"))
+            .header("x-trusted-access", &bound_access)
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    // Give any queued connector dial a chance to reach the target listener.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        before_invalid,
+        "invalid method/path/upgrade must not dial the node's local target"
+    );
     assert_eq!(
         http.get(format!("http://{address}/v1/tunnel/{route}"))
             .bearer_auth(&bound_access)

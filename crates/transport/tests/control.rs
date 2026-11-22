@@ -172,10 +172,21 @@ async fn control_uses_live_fleet_scope_and_binds_node_and_stateful_clients() {
     }
 
     let binding = json!({"id":"ab".repeat(32),"method":"POST","path":"/v1/chat/completions","body_sha256":"cd".repeat(32)});
+    // A single invocation must be pinned even when only one replica is ready.
+    assert_eq!(
+        http.post(format!("{base}v1/runtime/connections"))
+            .bearer_auth("film-user")
+            .json(&json!({"service":service,"http_request":binding}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
     let bound: Value = http
         .post(format!("{base}v1/runtime/connections"))
         .bearer_auth("film-user")
-        .json(&json!({"service":service,"http_request":binding}))
+        .json(&json!({"service":service,"execution":execution,"http_request":binding}))
         .send()
         .await
         .unwrap()
@@ -197,13 +208,85 @@ async fn control_uses_live_fleet_scope_and_binds_node_and_stateful_clients() {
     assert_eq!(
         http.post(format!("{base}v1/runtime/connections"))
             .bearer_auth("film-user")
-            .json(&json!({"service":service,"http_request":invalid}))
+            .json(&json!({"service":service,"execution":execution,"http_request":invalid}))
             .send()
             .await
             .unwrap()
             .status(),
         400
     );
+
+    let original = view.lock().unwrap().clone();
+    let first = original["runtime_instances"][0].clone();
+    let mut second = first.clone();
+    second["execution"]["allocation_id"] = json!("comfy-1");
+    second["execution"]["lease_id"] = json!("second");
+    second["execution"]["node_id"] = json!("edge-b");
+    view.lock().unwrap()["runtime_instances"] = json!([first, second]);
+    let discover: Value = http
+        .post(format!("{base}v1/runtime/connections"))
+        .bearer_auth("film-user")
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(discover.as_array().unwrap().len(), 2);
+    for selector in [
+        json!({}),
+        json!({"execution":execution}),
+        json!({"route_id":bound[0]["route_id"]}),
+        json!({"execution":execution,"route_id":discover[1]["route_id"]}),
+    ] {
+        let mut invocation = json!({"service":service,"http_request":binding});
+        invocation
+            .as_object_mut()
+            .unwrap()
+            .extend(selector.as_object().unwrap().clone());
+        let response = http
+            .post(format!("{base}v1/runtime/connections"))
+            .bearer_auth("film-user")
+            .json(&invocation)
+            .send()
+            .await
+            .unwrap();
+        if selector.as_object().unwrap().is_empty() {
+            assert_eq!(response.status(), 400);
+        } else if selector.get("execution").is_some() && selector.get("route_id").is_some() {
+            assert_eq!(response.status(), 503);
+        } else {
+            let connections: Vec<Value> =
+                response.error_for_status().unwrap().json().await.unwrap();
+            assert_eq!(connections.len(), 1);
+            assert_eq!(connections[0]["execution"], execution);
+            let grant = Verifier::new(&pubkey, "test".into())
+                .unwrap()
+                .verify(connections[0]["token"].as_str().unwrap(), Purpose::Access)
+                .unwrap();
+            assert_eq!(serde_json::to_value(grant.execution).unwrap(), execution);
+            assert_eq!(
+                serde_json::to_value(grant.http_request.unwrap()).unwrap(),
+                binding
+            );
+        }
+    }
+    // Fail closed on duplicate Fleet entries instead of signing two grants.
+    view.lock().unwrap()["runtime_instances"] = json!([first, first]);
+    assert_eq!(
+        http.post(format!("{base}v1/runtime/connections"))
+            .bearer_auth("film-user")
+            .json(&json!({"service":service,"execution":execution,"http_request":binding}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    *view.lock().unwrap() = original;
 
     let access = || {
         http.post(format!("{base}v1/runtime/connections"))

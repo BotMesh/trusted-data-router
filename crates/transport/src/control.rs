@@ -122,7 +122,7 @@ struct Instance {
 #[serde(deny_unknown_fields)]
 pub struct ConnectionRequest {
     pub service: ServiceId,
-    /// Present when renewing credentials for an existing, stateful session.
+    /// Pins an existing stateful session or a single HTTP invocation.
     pub execution: Option<ExecutionIdentity>,
     /// Stable opaque address saved by clients; never resolves to a replacement.
     pub route_id: Option<String>,
@@ -514,6 +514,11 @@ impl Gateway {
         }
         if let Some(binding) = &request.http_request {
             binding.validate()?;
+            // Consumption is durable on the selected node, not shared across
+            // replicas. One invocation must never produce fallback routes.
+            if request.execution.is_none() && request.route_id.is_none() {
+                return Err(Error::InvalidContract);
+            }
         }
         let mut request = request.clone();
         if purpose == Purpose::Probe || request.service.service == "control" {
@@ -566,7 +571,7 @@ impl Gateway {
         } else {
             None
         };
-        let mut output = Vec::new();
+        let mut selected = Vec::new();
         for instance in self.instances(fleet_token, &request.service).await? {
             if request
                 .execution
@@ -599,17 +604,26 @@ impl Gateway {
             if request.route_id.as_ref().is_some_and(|r| r != &route_id) {
                 continue;
             }
+            selected.push(grant);
+        }
+        if selected.is_empty() {
+            return Err(Error::Unavailable);
+        }
+        if request.http_request.is_some() && selected.len() != 1 {
+            return Err(Error::InvalidContract);
+        }
+        let signing_key = self.checked_signing_key()?;
+        let mut output = Vec::with_capacity(selected.len());
+        for grant in selected {
+            let route_id = grant.route_id();
             output.push(Connection {
                 execution: grant.execution.clone(),
                 service: grant.service.clone(),
                 base_url: format!("{}v1/http/{}", self.relay, route_id),
                 route_id,
-                token: grants::sign(&self.checked_signing_key()?, &grant)?,
+                token: grants::sign(&signing_key, &grant)?,
                 expires_at: grant.exp,
             });
-        }
-        if output.is_empty() {
-            return Err(Error::Unavailable);
         }
         Ok(output)
     }

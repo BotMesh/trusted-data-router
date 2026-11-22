@@ -622,16 +622,6 @@ async fn http_proxy(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpRe
         .get("x-trusted-access")
         .cloned()
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    let session = relay.session(&grant)?;
-    let access = relay.track_access(&grant, &session)?;
-    let slot = Arc::new(
-        session
-            .slots
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?,
-    );
-    let stream = open(&session).await?;
     let websocket = has_token(req.headers(), "upgrade", "websocket");
     let client_upgrade = if websocket {
         Some(hyper::upgrade::on(&mut req))
@@ -654,6 +644,17 @@ async fn http_proxy(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpRe
         }
     }
     *req.uri_mut() = path.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    // Reject invalid request bindings before opening a stream to the node.
+    let session = relay.session(&grant)?;
+    let access = relay.track_access(&grant, &session)?;
+    let slot = Arc::new(
+        session
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?,
+    );
+    let stream = open(&session).await?;
     strip_hop(req.headers_mut(), websocket);
     // A local shim ingress verifies the exact signed execution before injecting
     // native app credentials. Never trust the client's copy of this header.

@@ -101,6 +101,12 @@ the principal's ownership and the current Fleet allocation. It must issue the
 `iss`, `aud: trusted-data-router/v1`, `sub`, `nbf`, `exp` and a purpose of `register`,
 `access` or `revoke`. Maximum lifetime is one hour. `route_id()` addresses the
 exact execution; clients never silently fail over to another lease/replica.
+Requests containing an `http_request` binding must pin `execution` or `route_id`
+and resolve to exactly one ready instance. Discover replicas first, then request
+the invocation grant for the selected instance. A lease change fails admission;
+the same invocation must not be reissued for a different replica after an
+ambiguous outcome. Invalid method, path or WebSocket upgrade is rejected before
+the relay opens a stream to the node.
 The CLI's `sign PRIVATE_KEY_PEM` reads this bounded JSON from stdin and writes a
 JWT to stdout for deployment tooling. Signing is a control-plane operation, not
 a public unauthenticated token endpoint.
