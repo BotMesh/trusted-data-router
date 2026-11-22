@@ -122,12 +122,28 @@ or by the 30-second control-lease deadline during an outage.
 The separate `authorization.revision` is delivered as a full bounded snapshot on
 each poll and acknowledged via `applied_authorization_revision` only after SQLite
 commit and cancellation. Fleet status includes `delivered_authorization_revision`
-and `applied_authorization_revision`. The relay rejects removed revocations,
+and `applied_authorization_revision`. The relay rejects uncovered removed revocations,
 policy rollback, snapshot removal and conflicting equal revisions. Session/user
 revocation cancels only matching access streams; policy changes cancel matching
 old-version streams. New grants reuse the existing connector. Restart requires a
 fresh sync before access resumes. Legacy grants are rejected after activation;
 scoped grants are rejected on a relay without authorization state.
+
+Relays advertise `revocation-compaction-v1` to allow safe consolidation. On an
+explicit principal-wide revocation, Fleet replaces that principal's covered
+session records in one durable update. Repeating a broad revocation also removes
+redundant session records left by older versions. The relay independently checks
+that every removed denial is covered by a retained denial for the same namespace,
+principal and service scope. An application-only ban cannot replace an operator
+ban; compaction never infers a principal ban from many session bans. Existing
+denials and active-stream cancellation survive restart. Upgrade the relay first;
+older relays retain append-only behavior and can reject a compacted snapshot on
+rollback. Never reset their database to work around that rejection.
+
+This recovers only redundant records. Distinct permanent bans still count toward
+the 64-record namespace budget and 1024-record router limit; route tombstones keep
+their separate 4096-record limit. Time-based expiry, general pagination and HA
+remain pending. Do not treat this compaction as unbounded migration capacity.
 
 Deploy the new Fleet, relay **and shim grant parser** before enabling identity
 mode in the backend. Older shims reject the additive access claim. Do not enable

@@ -32,6 +32,62 @@ async fn listen(router: Router) -> (std::net::SocketAddr, tokio::task::JoinHandl
         }),
     )
 }
+
+#[test]
+fn revocation_compaction_cannot_weaken_scope_or_reset_history() {
+    use trusted_router_transport::authorization::{AuthorizationState, SubjectRevocation};
+    let session = SubjectRevocation {
+        namespace: "ab".repeat(16),
+        principal: "12".repeat(32),
+        session: Some("34".repeat(32)),
+        application_only: Some(true),
+    };
+    let old = AuthorizationState {
+        revision: 1,
+        policies: vec![],
+        revoked_subjects: vec![session.clone()],
+    };
+    let mut user = session.clone();
+    user.session = None;
+    let mut compacted = AuthorizationState {
+        revision: 2,
+        revoked_subjects: vec![user.clone()],
+        ..old.clone()
+    };
+    compacted.validate(Some(&old)).unwrap();
+    // Legacy all-service scope (absent/false) is wider than application-only.
+    for application_only in [None, Some(false)] {
+        compacted.revoked_subjects[0].application_only = application_only;
+        compacted.validate(Some(&old)).unwrap();
+        let mut narrowed = compacted.clone();
+        narrowed.revision += 1;
+        narrowed.revoked_subjects[0].application_only = Some(true);
+        assert!(narrowed.validate(Some(&compacted)).is_err());
+    }
+    compacted.revoked_subjects = vec![user];
+    let mut changed = compacted.clone();
+    changed.revision = old.revision;
+    assert!(changed.validate(Some(&old)).is_err());
+    changed = old.clone();
+    changed.revision = 3;
+    assert!(changed.validate(Some(&compacted)).is_err()); // user -> one session
+    changed.revoked_subjects[0].session = Some("56".repeat(32));
+    assert!(changed.validate(Some(&old)).is_err()); // replacing a different session
+    for field in ["namespace", "principal"] {
+        let mut replacement = serde_json::to_value(&session).unwrap();
+        replacement[field] = json!(if field == "namespace" {
+            "cd".repeat(16)
+        } else {
+            "56".repeat(32)
+        });
+        changed = old.clone();
+        changed.revision = 3;
+        changed.revoked_subjects = vec![serde_json::from_value(replacement).unwrap()];
+        assert!(changed.validate(Some(&old)).is_err());
+    }
+    changed.revoked_subjects.clear();
+    assert!(changed.validate(Some(&compacted)).is_err());
+}
 #[tokio::test]
 async fn session_user_and_policy_changes_cancel_only_matching_streams_without_restarting_connector()
 {
@@ -251,10 +307,8 @@ async fn acceptance() {
     assert!(c.next().await.unwrap().is_ok());
     assert_eq!(ready(&first).send().await.unwrap().status(), 403);
     response.lock().unwrap()["authorization"]["revision"] = json!(3);
-    response.lock().unwrap()["authorization"]["revoked_subjects"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"namespace":ns,"principal":first.sub,"session":null}));
+    response.lock().unwrap()["authorization"]["revoked_subjects"] =
+        json!([{"namespace":ns,"principal":first.sub,"session":null}]);
     client.poll_once(&relay).await.unwrap();
     tokio::time::timeout(Duration::from_secs(1), async {
         while let Some(Ok(_)) = b.next().await {}
@@ -262,6 +316,8 @@ async fn acceptance() {
     .await
     .unwrap();
     assert!(c.next().await.unwrap().is_ok());
+    assert_eq!(ready(&first).send().await.unwrap().status(), 403);
+    assert_eq!(ready(&second).send().await.unwrap().status(), 403);
     response.lock().unwrap()["authorization"]["revision"] = json!(4);
     response.lock().unwrap()["authorization"]["policies"][0]["version"] = json!(2);
     response.lock().unwrap()["authorization"]["policies"][0]["sha256"] = json!("cd".repeat(32));

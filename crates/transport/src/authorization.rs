@@ -58,6 +58,16 @@ pub struct SubjectRevocation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub application_only: Option<bool>,
 }
+impl SubjectRevocation {
+    /// Replacement must deny every identity and service denied by the old record.
+    /// In particular, application-only revocation cannot replace operator denial.
+    fn covers(&self, old: &Self) -> bool {
+        self.namespace == old.namespace
+            && self.principal == old.principal
+            && (self.session.is_none() || self.session == old.session)
+            && (self.application_only != Some(true) || old.application_only == Some(true))
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorizationState {
@@ -114,7 +124,7 @@ impl AuthorizationState {
                 || old
                     .revoked_subjects
                     .iter()
-                    .any(|s| !self.revoked_subjects.contains(s))
+                    .any(|s| !self.revoked_subjects.iter().any(|new| new.covers(s)))
                 || old.policies.iter().any(|p| {
                     !self.policies.iter().any(|n| {
                         n.namespace == p.namespace

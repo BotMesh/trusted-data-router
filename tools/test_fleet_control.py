@@ -206,15 +206,26 @@ def acceptance(fleet_binary, router_binary, root):
         eventually(lambda: request(fleet + "/routers/relay-a", admin)[1]["applied_authorization_revision"] == 2)
         closed(stream, 2)
         assert second_stream.readline()  # another session on the same connector continues
-        policy.update(version=2, sha256="cd" * 32)
-        assert request(fleet + "/routers/relay-a/access-policy", admin, "PUT", policy)[0] == 200
+        third = copy.deepcopy(second)
+        third["sub"] = third["access"]["principal"] = "22" * 32
+        third_stream = events(next_route, signed(third, "access"))
+        status, compacted = request(fleet + "/routers/relay-a/revoke-subject", backend, "POST",
+            {"namespace": namespace, "principal": identity["principal"], "session": None})
+        assert status == 200 and len(compacted["revoked_subjects"]) == 1
         eventually(lambda: request(fleet + "/routers/relay-a", admin)[1]["applied_authorization_revision"] == 3)
         closed(second_stream, 2)
-        second["access"].update(policy_version=2, policy_sha256=policy["sha256"])
-        stream = events(next_route, signed(second, "access"))  # same runtime/connector, new approved policy
+        assert third_stream.readline()  # another principal retains access
+        for denied in (next_grant, second):
+            assert request(relay + "/v1/ready/" + next_route, signed(denied, "access"))[0] == 403
+        policy.update(version=2, sha256="cd" * 32)
+        assert request(fleet + "/routers/relay-a/access-policy", admin, "PUT", policy)[0] == 200
+        eventually(lambda: request(fleet + "/routers/relay-a", admin)[1]["applied_authorization_revision"] == 4)
+        closed(third_stream, 2)
+        third["access"].update(policy_version=2, policy_sha256=policy["sha256"])
+        stream = events(next_route, signed(third, "access"))  # same runtime/connector, new approved policy
         stop(fleet_process)
         closed(stream, 33)
-        print("PASS: real Fleet sync, applied ACK, route/session revocation, policy upgrade without runtime replacement, durable restart, downgrade refusal, control outage expiry")
+        print("PASS: real Fleet sync, applied ACK, route/session revocation and safe compaction, policy upgrade without runtime replacement, durable restart, downgrade refusal, control outage expiry")
     finally:
         for process in reversed(children):
             stop(process)
