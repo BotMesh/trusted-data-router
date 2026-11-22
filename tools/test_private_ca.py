@@ -87,6 +87,7 @@ def acceptance(binary, root):
     openssl("genpkey", "-algorithm", "ED25519", "-out", signing)
     signing.chmod(0o600)
     openssl("pkey", "-in", signing, "-pubout", "-out", public)
+    public.chmod(0o644)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Fleet)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)

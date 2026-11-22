@@ -128,6 +128,7 @@ def acceptance(fleet_binary, router_binary, root):
         subprocess.run(["openssl", "genpkey", "-algorithm", "ED25519", "-out", str(private)], check=True, capture_output=True)
         private.chmod(0o600)
         subprocess.run(["openssl", "pkey", "-in", str(private), "-pubout", "-out", str(public)], check=True, capture_output=True)
+        public.chmod(0o644)
         env = os.environ.copy()
         env.update(TRUSTED_ROUTER_FLEET_URL=fleet, TRUSTED_ROUTER_ID="relay-a", TRUSTED_ROUTER_TOKEN_FILE=str(token_file))
         relay_args = [router_binary, "relay", f"127.0.0.1:{rp}", str(root / "routes.db"), str(public), "gateway"]
