@@ -112,6 +112,13 @@ trusted-data-router connect wss://relay.example/v1/connect/ROUTE_ID 127.0.0.1:18
 Grant files must be private regular files (0600). Replace the registration file
 atomically before expiry; reconnect rereads it. Connection loss closes in-flight
 streams; reconnect uses bounded exponential backoff and never replays a request.
+The transport sends standard WebSocket Ping controls every 15 seconds after a
+matching Pong and requires the next matching Pong within 15 seconds. This keeps
+idle NAT/proxy mappings active and detects silent network loss within about 30
+seconds, plus runtime scheduling delay. Controls never become application bytes.
+Configure ingress idle timeouts above this interval (60 seconds or more is a
+reasonable margin). A severely stalled transport also times out; interrupted
+mutations must be reconciled by the application, never automatically replayed.
 The embedded gateway issues registration leases for 30 seconds from the start of
 each live Fleet readiness check. Shim renews them on the same transport before
 expiry; healthy renewal preserves HTTP/SSE/WebSocket streams. If Fleet no longer
@@ -191,6 +198,41 @@ cargo test --locked --workspace
 
 The local test creates ephemeral Ed25519 keys with `openssl`; no production
 credentials, remote cluster or local prover is used.
+
+Optional network acceptance uses the actual router executable:
+
+```sh
+# Linux, passwordless sudo, iproute2, iptables, openssl, Python >=3.11 + aiohttp.
+python tools/test_nat.py --router-binary /path/to/trusted-data-router \
+  --artifacts /private/artifacts/nat-test
+# Authorized nonproduction SSH host, Python venv there; cloudflared locally.
+python tools/test_remote.py --ssh-host test-node --router-binary /path/to/trusted-data-router \
+  --artifacts /private/artifacts/remote-test
+```
+
+The NAT test uses five isolated network namespaces and two stateful NATs with
+overlapping node addresses. Only outbound TCP/443 is allowed. It checks blocked
+new inbound connections, TLS trust/hostname rejection, tenant and application-key
+isolation, idle continuity through a 25-second proxy timeout, silent network loss,
+SSE/WS drain, unaffected peer traffic and recovery without request replay. It
+changes no host firewall or routes and removes its namespaces afterward.
+
+The remote test installs a private, self-expiring fixture on the specified SSH
+host. SSH carries setup/cleanup only; application traffic uses an outgoing WSS
+connector. The application and local relay listen on loopback. A temporary
+[Cloudflare Quick Tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
+provides public test ingress without changing existing proxies or opening ports.
+This development service has no availability guarantee and does not proxy HTTP
+SSE directly; the test client connects to the local relay and SSE crosses the
+remote connector inside WSS. The remote fixture needs outbound HTTPS for Python
+dependency installation and WSS, while local cloudflared also needs its tunnel
+egress. Test-owned processes and the remote temporary directory are removed.
+
+These tests use synthetic signed grants and application fixtures. They validate
+transport, not Fleet control synchronization, production Film/ClawUp workloads,
+TEE attestation or new ZK proofs. Keep the private artifact directory outside the
+checkout. Deployment still needs its own dedicated TLS ingress and control-plane
+acceptance; a successful tunnel test does not complete application migration.
 
 The optional [central connection gateway](crates/transport/CONTROL.md) embeds in an application's backend and issues grants only after checking Fleet's live runtime discovery and caller scope. It uses the same transport crate; no second runtime catalog is introduced.
 
