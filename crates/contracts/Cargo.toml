@@ -1,6 +1,6 @@
 [package]
 name = "trusted-contracts"
-description = "Shared workload identity contracts for BotMesh runtime components"
+description = "Shared workload identity contracts for attestx runtime components"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
