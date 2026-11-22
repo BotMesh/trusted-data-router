@@ -17,8 +17,8 @@ Data router -> Fleet control API (outbound sync, applied revision ACK)
 Central gateway -> access grants
 ```
 
-Business payloads do not pass through ClawUp backend, OpenShell gateway or Fleet
-heartbeats. Native upstream control connections remain control traffic. Fleet
+The relay and node connector carry application traffic. OpenShell gateway
+connections and Fleet heartbeats carry control information. Native upstream control connections remain control traffic. Fleet
 owns scheduling; shim owns local execution; this project owns service access.
 
 The small `trusted-contracts` crate hosts shared execution, policy and service
@@ -38,8 +38,7 @@ All records are proposed v0.1 interfaces, not a frozen public wire protocol.
 ## Interfaces
 
 - `ExecutionIdentity`: namespace, workload, allocation, lease, generation, node.
-  Generations must come from durable authoritative state; Fleet ordinary app
-  deployments still need this binding. An access expiry does not release resources.
+  Fleet binds generations to durable allocation state for shim-managed apps. An access expiry does not release resources.
 - `ServiceSpec`: logical service plus an opaque endpoint resolved by a runtime
   adapter. ClawUp maps bots to workloads; Film maps model servers and workers.
 - `Authorizer`: independently verifies service registration and user access.
@@ -56,6 +55,10 @@ Neither capability can revoke a route or mint another capability. Credentials
 never appear in routing URLs, process arguments or application headers.
 
 ## Running the data plane
+
+For deployment use the independent [Compose project](deploy/README.md). It packages
+the relay and TLS ingress separately from Fleet and application backends. The
+[image workflow](.github/workflows/image.yml) publishes the CLI to GHCR.
 
 Build with `cargo build --locked --release -p trusted-router-transport`. Run the relay
 with a private, persistent state directory:
@@ -159,7 +162,7 @@ Access requires the same policy revision as the live registration. A routing
 capability proves authorization by its issuer, **not** policy evaluation or TEE
 attestation; those proofs and OpenShell enforcement belong in rail/shim.
 
-## Reuse and integration plan
+## Reuse and integration
 
 The transport directly composes established Rust protocols/libraries. It defines
 no custom multiplexing or cryptographic protocol. The initial framework also
@@ -175,14 +178,14 @@ Extend existing ClawUp `bot_runtimes.json` and Fleet app specs. Backend-specific
 transport configuration may be generated as private runtime state, not maintained
 as a second user-authored runtime catalog.
 
-First acceptance slice: ClawUp chat and Film Qwen/vLLM over the same data plane,
-using outbound-only edge connections. Test HTTP streaming and WebSocket, tenant
-isolation, grant expiry, active revocation, reconnect and stale-instance rejection.
+ClawUp chat and Film model services use opt-in adapters over this data plane.
+Acceptance covers outbound-only connections, streaming, tenant isolation, grant
+expiry, revocation, reconnect and stale-instance rejection.
 The real-socket test covers HTTP, SSE, raw-tunnel and direct HTTP WebSocket upgrades,
 tenant/lease isolation, purpose separation, access expiry, active revocation,
-reconnect and persisted revocation. Next, ComfyUI
-needs instance affinity. Film's staged files and shared-directory Blender queue
-need separate artifact/worker adapters; a tunnel does not migrate storage.
+reconnect and persisted revocation. Film pins ComfyUI requests to an exact
+instance and supplies an SSH/rsync storage adapter. Its shared-directory Blender
+queue still requires shared storage; a tunnel does not migrate files.
 
 TEE endpoint identity and end-to-end confidentiality are separate requirements.
 TLS terminating at the relay does not hide plaintext from that relay. QUIC is an

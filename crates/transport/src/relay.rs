@@ -125,6 +125,9 @@ impl Relay {
     }
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
+            // Process liveness only; route readiness and authorization remain
+            // checked by their authenticated endpoints and Fleet control lease.
+            .route("/healthz", get(|| async { StatusCode::OK }))
             .route("/v1/connect/{route}", get(connect))
             .route("/v1/connect/{route}/renew", post(renew))
             .route("/v1/tunnel/{route}", get(tunnel))

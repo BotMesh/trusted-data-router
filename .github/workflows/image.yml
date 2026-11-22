@@ -1,0 +1,51 @@
+name: Container image
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  image:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly-2026-09-17
+      - uses: Swatinem/rust-cache@v2
+      - run: python3 -m unittest discover -s deploy/tests -p 'test_*.py'
+      - name: Build release binaries
+        run: |
+          mkdir -p target/image
+          cargo build --locked --release -p trusted-router-transport --bin trusted-data-router
+          install -m 755 target/release/trusted-data-router target/image/
+          cp deploy/Dockerfile target/image/Dockerfile
+      - name: Build and check image
+        run: |
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          REVISION=$(git rev-parse HEAD)
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "REVISION=$REVISION" >> "$GITHUB_ENV"
+          docker build --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$REVISION" -t "$IMAGE:sha-$REVISION" target/image
+          docker run --rm --entrypoint sh "$IMAGE:sha-$REVISION" -c 'test -x /usr/local/bin/trusted-data-router'
+      - name: Publish to GHCR
+        if: github.event_name != 'pull_request'
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:sha-$REVISION"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            docker tag "$IMAGE:sha-$REVISION" "$IMAGE:${GITHUB_REF_NAME#v}"
+            docker push "$IMAGE:${GITHUB_REF_NAME#v}"
+          fi
