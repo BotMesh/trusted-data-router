@@ -70,8 +70,27 @@ long read timeouts. TLS must cover both clients and nodes; the relay intentional
 refuses a non-loopback plaintext listener. No changes to the backend or Fleet's
 heartbeat proxy are needed. Relay and TLS proxy see plaintext application data;
 this is not TEE end-to-end confidentiality. This version serves one relay with a
-durable local database; an HA route directory and signing-key overlap are future
-work. Never run concurrent relay processes against the same database.
+durable local database; an HA route directory remains future work. Never run
+concurrent relay processes against the same database.
+
+The existing public-key PEM file can contain up to eight distinct Ed25519 public
+keys. The relay and `Verifier::from_file` reload it on each new admission. Gateways
+created from the existing environment also reload their signing-key and public-key
+files; embedders using `Gateway::new` can opt in with `with_key_files`. Invalid,
+missing, truncated or writable-by-others trust files reject new requests rather
+than retaining stale keys. Private files require 0600; public files may be 0644.
+Use atomic replacement, not an in-place write.
+
+For rotation, first distribute the old+new public PEM bundle to every gateway,
+relay and shim. Then replace the gateway signing key and reissue node enrollment
+credentials with the new key. Enrollment credentials can live for 30 days, so
+waiting for the one-hour maximum route-grant lifetime alone is insufficient.
+Once old enrollments are replaced and old route grants have expired, remove the
+old public key. Exact route IDs do not change, connector renewal uses the same
+connection, and admitted streams retain their original expiry and Fleet
+revocation checks. Removing a key blocks new admissions; it does not retroactively
+terminate previously admitted streams. Use Fleet route/subject revocation for
+immediate withdrawal of active access.
 
 The application's authenticated control gateway uses `grants::sign` after checking
 the principal's ownership and the current Fleet allocation. It must issue the
@@ -93,6 +112,24 @@ trusted-data-router connect wss://relay.example/v1/connect/ROUTE_ID 127.0.0.1:18
 Grant files must be private regular files (0600). Replace the registration file
 atomically before expiry; reconnect rereads it. Connection loss closes in-flight
 streams; reconnect uses bounded exponential backoff and never replays a request.
+The transport sends standard WebSocket Ping controls every 15 seconds after a
+matching Pong and requires the next matching Pong within 15 seconds. This keeps
+idle NAT/proxy mappings active and detects silent network loss within about 30
+seconds, plus runtime scheduling delay. Controls never become application bytes.
+Configure ingress idle timeouts above this interval (60 seconds or more is a
+reasonable margin). A severely stalled transport also times out; interrupted
+mutations must be reconciled by the application, never automatically replayed.
+The embedded gateway issues registration leases for 30 seconds from the start of
+each live Fleet readiness check. Shim renews them on the same transport before
+expiry; healthy renewal preserves HTTP/SSE/WebSocket streams. If Fleet no longer
+publishes the exact service, or the gateway is unreachable, the last lease expires
+and the relay drains all streams even when application Access tokens remain valid
+(up to 900 seconds). With Fleet's five-second native gateway observation cache,
+native readiness loss can take about 35 seconds to drain, plus timer/clock skew.
+Synchronize gateway and relay clocks. Transient loss does not create a permanent
+route revocation; recovery reconnects the same execution without replaying work.
+Roll out the gateway before relying on this bound: older issuers' existing longer
+leases retain their signed expiry, including through an earlier short renewal.
 The caller must supervise the connector for the allocation's lifetime. Stop it
 and revoke its route before releasing/reusing the runtime's local endpoint.
 
@@ -162,6 +199,41 @@ cargo test --locked --workspace
 The local test creates ephemeral Ed25519 keys with `openssl`; no production
 credentials, remote cluster or local prover is used.
 
+Optional network acceptance uses the actual router executable:
+
+```sh
+# Linux, passwordless sudo, iproute2, iptables, openssl, Python >=3.11 + aiohttp.
+python tools/test_nat.py --router-binary /path/to/trusted-data-router \
+  --artifacts /private/artifacts/nat-test
+# Authorized nonproduction SSH host, Python venv there; cloudflared locally.
+python tools/test_remote.py --ssh-host test-node --router-binary /path/to/trusted-data-router \
+  --artifacts /private/artifacts/remote-test
+```
+
+The NAT test uses five isolated network namespaces and two stateful NATs with
+overlapping node addresses. Only outbound TCP/443 is allowed. It checks blocked
+new inbound connections, TLS trust/hostname rejection, tenant and application-key
+isolation, idle continuity through a 25-second proxy timeout, silent network loss,
+SSE/WS drain, unaffected peer traffic and recovery without request replay. It
+changes no host firewall or routes and removes its namespaces afterward.
+
+The remote test installs a private, self-expiring fixture on the specified SSH
+host. SSH carries setup/cleanup only; application traffic uses an outgoing WSS
+connector. The application and local relay listen on loopback. A temporary
+[Cloudflare Quick Tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
+provides public test ingress without changing existing proxies or opening ports.
+This development service has no availability guarantee and does not proxy HTTP
+SSE directly; the test client connects to the local relay and SSE crosses the
+remote connector inside WSS. The remote fixture needs outbound HTTPS for Python
+dependency installation and WSS, while local cloudflared also needs its tunnel
+egress. Test-owned processes and the remote temporary directory are removed.
+
+These tests use synthetic signed grants and application fixtures. They validate
+transport, not Fleet control synchronization, production Film/ClawUp workloads,
+TEE attestation or new ZK proofs. Keep the private artifact directory outside the
+checkout. Deployment still needs its own dedicated TLS ingress and control-plane
+acceptance; a successful tunnel test does not complete application migration.
+
 The optional [central connection gateway](crates/transport/CONTROL.md) embeds in an application's backend and issues grants only after checking Fleet's live runtime discovery and caller scope. It uses the same transport crate; no second runtime catalog is introduced.
 
 Before dispatching a one-shot HTTP mutation, clients can check
@@ -171,3 +243,7 @@ no application bytes and does not consume a request-bound grant. Fleet health
 and relay registration can become ready at different times after a restart.
 `Gateway::ready` exposes this check to embedding applications. Availability can
 still change after the check; never automatically replay an ambiguous mutation.
+
+Fleet-managed access can bind each stream to a business principal/session and
+current service policy. See [control synchronization](crates/transport/CONTROL.md)
+for opt-in rollout, delegated namespace permissions, applied ACKs and capacity limits.

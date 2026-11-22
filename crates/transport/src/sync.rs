@@ -16,6 +16,8 @@ pub struct SyncRequest {
     pub epoch: Option<String>,
     pub after_revision: u64,
     pub applied_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_authorization_revision: Option<u64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +29,8 @@ pub struct SyncResponse {
     pub revision: u64,
     pub revoked_routes: Vec<String>,
     pub lease_seconds: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<crate::authorization::AuthorizationState>,
 }
 
 pub(crate) fn valid_id(id: &str) -> bool {
@@ -51,11 +55,28 @@ pub(crate) struct ManagedControl {
     issuer: String,
     epoch: Option<String>,
     revision: u64,
+    #[serde(default)]
+    authorization: Option<crate::authorization::AuthorizationState>,
     // Monotonic and intentionally not persisted. A restart must contact Fleet.
     #[serde(skip)]
     deadline: Option<Instant>,
 }
 impl crate::relay::Directory {
+    pub(crate) fn check_access(
+        &self,
+        grant: &crate::grants::Grant,
+    ) -> std::result::Result<(), axum::http::StatusCode> {
+        let authorized = match self.control.as_ref().and_then(|c| c.authorization.as_ref()) {
+            Some(auth) => auth.allows(grant),
+            None => grant.access.is_none(),
+        };
+        if authorized {
+            Ok(())
+        } else {
+            Err(axum::http::StatusCode::FORBIDDEN)
+        }
+    }
+
     pub(crate) fn check_control(&mut self) -> std::result::Result<(), axum::http::StatusCode> {
         if self
             .control
@@ -96,6 +117,7 @@ impl Relay {
             issuer: self.verifier.issuer.clone(),
             epoch: None,
             revision: 0,
+            authorization: None,
             deadline: None,
         };
         directory
@@ -132,6 +154,7 @@ impl Relay {
             epoch: state.epoch.clone(),
             after_revision: state.revision,
             applied_revision: state.epoch.as_ref().map(|_| state.revision),
+            applied_authorization_revision: state.authorization.as_ref().map(|a| a.revision),
         })
     }
     fn apply_control(
@@ -169,6 +192,11 @@ impl Relay {
         {
             return Err(Error::InvalidContract);
         }
+        match &update.authorization {
+            Some(auth) => auth.validate(state.authorization.as_ref())?,
+            None if state.authorization.is_some() => return Err(Error::InvalidContract),
+            None => {}
+        }
         let deadline = started + Duration::from_secs(update.lease_seconds.into());
         if deadline <= Instant::now() {
             return Err(Error::StaleExecution);
@@ -176,6 +204,7 @@ impl Relay {
         let next = ManagedControl {
             epoch: Some(update.epoch.clone()),
             revision: update.revision,
+            authorization: update.authorization.clone(),
             deadline: Some(deadline),
             ..state.clone()
         };
@@ -195,6 +224,13 @@ impl Relay {
         for route in &update.revoked_routes {
             if let Some(session) = directory.sessions.remove(route) {
                 session.cancel.cancel();
+            }
+        }
+        if let Some(auth) = &next.authorization {
+            for stream in directory.streams.values() {
+                if !auth.allows(&stream.grant) {
+                    stream.cancel.cancel();
+                }
             }
         }
         directory.control = Some(next);
@@ -263,7 +299,11 @@ impl ControlClient {
                     .ok_or(Error::InvalidContract)
             })
             .collect::<Result<_>>()?;
-        Self::new(&values[0], values[1].clone(), PathBuf::from(&values[2])).map(Some)
+        let mut client = Self::new(&values[0], values[1].clone(), PathBuf::from(&values[2]))?;
+        if let Some(ca) = crate::control::ca_from_env("TRUSTED_ROUTER_FLEET_CA_FILE")? {
+            client.http = crate::control::http_client(Some(&ca))?;
+        }
+        Ok(Some(client))
     }
     /// A request acknowledges only the prior transaction, never the response
     /// about to be received. A crash before acknowledgment simply replays it.
@@ -279,6 +319,9 @@ impl ControlClient {
             .http
             .post(self.endpoint.clone())
             .bearer_auth(token.trim())
+            // Older Fleet versions ignore this header and keep accepting the
+            // unchanged JSON request. New Fleet gates default policies on it.
+            .header("x-fleet-router-capabilities", "workload-defaults-v1")
             .json(&request)
             .send()
             .await
@@ -292,7 +335,7 @@ impl ControlClient {
         }
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| Error::Unavailable)? {
-            if body.len() + chunk.len() > 512 * 1024 {
+            if body.len() + chunk.len() > 1024 * 1024 {
                 return Err(Error::InvalidContract);
             }
             body.extend_from_slice(&chunk);

@@ -9,7 +9,7 @@ use axum::{
     extract::{Request, State},
     http::{HeaderMap, StatusCode},
     response::Response,
-    routing::{any, delete, get},
+    routing::{any, delete, get, post},
     Router,
 };
 use futures::future::poll_fn;
@@ -27,7 +27,7 @@ use std::{
 };
 use tokio::{
     net::TcpListener,
-    sync::{mpsc, oneshot, Semaphore},
+    sync::{mpsc, oneshot, Notify, Semaphore},
 };
 use tokio_tungstenite::{
     tungstenite::{handshake::derive_accept_key, protocol::Role},
@@ -43,15 +43,48 @@ type Open = oneshot::Sender<yamux::Stream>;
 
 pub(crate) struct Session {
     grant: Grant,
+    expires_at: AtomicU64,
+    renewed: Notify,
     serial: u64,
     open: mpsc::Sender<Open>,
     pub(crate) cancel: CancellationToken,
     slots: Arc<Semaphore>,
 }
+impl Session {
+    async fn expired(&self) {
+        loop {
+            let changed = self.renewed.notified();
+            let deadline = self.expires_at.load(Ordering::Acquire);
+            if deadline <= grants::now() {
+                return;
+            }
+            tokio::select! { _ = changed => {}, _ = expires(deadline) => {} }
+        }
+    }
+}
 pub(crate) struct Directory {
     pub(crate) db: Connection,
     pub(crate) sessions: HashMap<String, Arc<Session>>,
     pub(crate) control: Option<crate::sync::ManagedControl>,
+    pub(crate) streams: HashMap<u64, AccessStream>,
+}
+pub(crate) struct AccessStream {
+    pub(crate) grant: Grant,
+    pub(crate) cancel: CancellationToken,
+}
+struct AccessGuard {
+    id: u64,
+    relay: std::sync::Weak<Relay>,
+    cancel: CancellationToken,
+}
+impl Drop for AccessGuard {
+    fn drop(&mut self) {
+        if let Some(relay) = self.relay.upgrade() {
+            if let Ok(mut directory) = relay.directory.lock() {
+                directory.streams.remove(&self.id);
+            }
+        }
+    }
 }
 pub struct Relay {
     pub(crate) verifier: Verifier,
@@ -84,6 +117,7 @@ impl Relay {
                 db,
                 control,
                 sessions: HashMap::new(),
+                streams: HashMap::new(),
             }),
             serial: AtomicU64::new(1),
             watchdog_started: AtomicBool::new(false),
@@ -92,6 +126,7 @@ impl Relay {
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
             .route("/v1/connect/{route}", get(connect))
+            .route("/v1/connect/{route}/renew", post(renew))
             .route("/v1/tunnel/{route}", get(tunnel))
             .route("/v1/ready/{route}", get(ready))
             .route("/v1/http/{route}/", any(http_proxy))
@@ -156,17 +191,49 @@ impl Relay {
             .lock()
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         directory.check_control()?;
+        if grant.purpose != Purpose::Probe {
+            directory.check_access(grant)?;
+        }
         let session = directory
             .sessions
             .get(&grant.route_id())
             .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
         if session.cancel.is_cancelled()
-            || session.grant.exp <= grants::now()
+            || session.expires_at.load(Ordering::Acquire) <= grants::now()
             || session.grant.policy != grant.policy
         {
             return Err(StatusCode::FORBIDDEN);
         }
         Ok(session.clone())
+    }
+    fn track_access(
+        self: &Arc<Self>,
+        grant: &Grant,
+        session: &Session,
+    ) -> std::result::Result<Arc<AccessGuard>, StatusCode> {
+        let mut directory = self
+            .directory
+            .lock()
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        directory.check_control()?;
+        directory.check_access(grant)?;
+        if session.cancel.is_cancelled() {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let id = self.serial.fetch_add(1, Ordering::Relaxed);
+        let cancel = session.cancel.child_token();
+        directory.streams.insert(
+            id,
+            AccessStream {
+                grant: grant.clone(),
+                cancel: cancel.clone(),
+            },
+        );
+        Ok(Arc::new(AccessGuard {
+            id,
+            relay: Arc::downgrade(self),
+            cancel,
+        }))
     }
 }
 
@@ -276,6 +343,8 @@ async fn connect(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResul
     let (tx, mut rx) = mpsc::channel::<Open>(64);
     let cancel = CancellationToken::new();
     let session = Arc::new(Session {
+        expires_at: AtomicU64::new(grant.exp),
+        renewed: Notify::new(),
         grant,
         serial: relay.serial.fetch_add(1, Ordering::Relaxed),
         open: tx,
@@ -384,7 +453,7 @@ async fn connect(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResul
             }
             Ok::<(), ()>(())
         };
-        tokio::select! { _ = run => {}, _ = cancel.cancelled() => {}, _ = expires(session.grant.exp) => {} }
+        tokio::select! { _ = run => {}, _ = cancel.cancelled() => {}, _ = session.expired() => {} }
         cancel.cancel();
         if let Ok(mut directory) = relay.directory.lock() {
             if directory
@@ -397,6 +466,40 @@ async fn connect(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResul
         }
     });
     Ok(response)
+}
+
+/// Renew only the node's existing transport lease. This never extends an
+/// application Access grant, changes its policy, or resurrects a revoked route.
+async fn renew(State(relay): State<Arc<Relay>>, req: Request) -> HttpResult {
+    let grant = relay.authenticate(&req, Purpose::Register)?;
+    let mut directory = relay
+        .directory
+        .lock()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    directory.check_control()?;
+    let session = directory
+        .sessions
+        .get(&grant.route_id())
+        .ok_or(StatusCode::CONFLICT)?;
+    let old = &session.grant;
+    if session.cancel.is_cancelled()
+        || session.expires_at.load(Ordering::Acquire) <= grants::now()
+        || old.iss != grant.iss
+        || old.sub != grant.sub
+        || old.execution != grant.execution
+        || old.service != grant.service
+        || old.policy != grant.policy
+        || old.access != grant.access
+        || old.http_request != grant.http_request
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    session.expires_at.fetch_max(grant.exp, Ordering::AcqRel);
+    session.renewed.notify_one();
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap())
 }
 
 async fn open(session: &Session) -> std::result::Result<yamux::Stream, StatusCode> {
@@ -417,7 +520,9 @@ pub(crate) async fn expires(exp: u64) {
 /// Observe the exact route without sending application bytes or consuming an
 /// HTTP invocation. Availability is advisory; mutations still must not replay.
 async fn ready(State(relay): State<Arc<Relay>>, req: Request) -> HttpResult {
-    let grant = relay.authenticate(&req, Purpose::Access)?;
+    let grant = relay
+        .authenticate(&req, Purpose::Access)
+        .or_else(|_| relay.authenticate(&req, Purpose::Probe))?;
     let session = relay.session(&grant)?;
     if session.open.is_closed() {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -434,6 +539,7 @@ async fn tunnel(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResult
         return Err(StatusCode::FORBIDDEN);
     }
     let session = relay.session(&grant)?;
+    let access = relay.track_access(&grant, &session)?;
     let slot = session
         .slots
         .clone()
@@ -450,7 +556,7 @@ async fn tunnel(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResult
             let _ = tokio::io::copy_bidirectional(&mut WsIo::new(ws), &mut upstream).await;
             Ok::<(), ()>(())
         };
-        tokio::select! { _ = copy => {}, _ = session.cancel.cancelled() => {}, _ = expires(grant.exp) => {} }
+        tokio::select! { _ = copy => {}, _ = access.cancel.cancelled() => {}, _ = expires(grant.exp) => {} }
     });
     Ok(response)
 }
@@ -514,6 +620,7 @@ async fn http_proxy(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpRe
         .cloned()
         .ok_or(StatusCode::UNAUTHORIZED)?;
     let session = relay.session(&grant)?;
+    let access = relay.track_access(&grant, &session)?;
     let slot = Arc::new(
         session
             .slots
@@ -554,10 +661,12 @@ async fn http_proxy(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpRe
         hyper::client::conn::http1::handshake(TokioIo::new(stream.compat()))
             .await
             .map_err(|_| StatusCode::BAD_GATEWAY)?;
-    let cancellation = session.cancel.clone();
+    let cancellation = access.cancel.clone();
+    let connection_access = access.clone();
     let connection_slot = slot.clone();
     tokio::spawn(async move {
         let _slot = connection_slot;
+        let _access = connection_access;
         tokio::select! { _ = connection.with_upgrades() => {}, _ = cancellation.cancelled() => {}, _ = expires(grant.exp) => {} }
     });
     let mut response = tokio::time::timeout(Duration::from_secs(30), sender.send_request(req))
@@ -580,7 +689,7 @@ async fn http_proxy(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpRe
                 .await;
                 Ok::<(), hyper::Error>(())
             };
-            tokio::select! { _ = copy => {}, _ = session.cancel.cancelled() => {}, _ = expires(grant.exp) => {} }
+            tokio::select! { _ = copy => {}, _ = access.cancel.cancelled() => {}, _ = expires(grant.exp) => {} }
         });
     }
     let upgraded = websocket && response.status() == StatusCode::SWITCHING_PROTOCOLS;
