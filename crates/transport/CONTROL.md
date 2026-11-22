@@ -2,6 +2,12 @@
 
 ## Fleet control synchronization
 
+The relay advertises `x-fleet-router-capabilities: workload-defaults-v1` on each
+authenticated sync. Fleet uses it to reject wildcard workload policies until the
+relay supports them. The JSON request remains compatible with older schedulers.
+Upgrade the relay and observe the capability in Fleet's router status before
+publishing defaults; keep a capable relay when rolling back after publication.
+
 Fleet owns the relay's revocation stream. Set all three variables on the relay
 to enable managed mode (existing static deployments remain opt-in):
 
