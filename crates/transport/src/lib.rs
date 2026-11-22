@@ -5,6 +5,7 @@ pub mod authorization;
 pub mod control;
 pub mod edge;
 pub mod grants;
+mod keys;
 pub mod relay;
 pub mod sync;
 pub mod transport;

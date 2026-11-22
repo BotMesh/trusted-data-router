@@ -75,6 +75,220 @@ async fn outbound_http_sse_websocket_auth_expiry_revocation_and_recovery() {
 }
 
 #[tokio::test]
+async fn registration_renewal_preserves_streams_without_extending_access_or_reviving_routes() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let temp = tempfile::tempdir().unwrap();
+    let private = temp.path().join("key");
+    let public = temp.path().join("pub");
+    assert!(Command::new("openssl")
+        .args(["genpkey", "-algorithm", "ED25519", "-out"])
+        .arg(&private)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("openssl")
+        .args(["pkey", "-in"])
+        .arg(&private)
+        .args(["-pubout", "-out"])
+        .arg(&public)
+        .status()
+        .unwrap()
+        .success());
+    let key = std::fs::read(private).unwrap();
+    let relay = Relay::new(
+        Verifier::new(&std::fs::read(public).unwrap(), "renewal-test".into()).unwrap(),
+        &temp.path().join("routes.db"),
+    )
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let relay_task = tokio::spawn(relay.serve(listener));
+    let (app, app_task) = application().await;
+    let start = grants::now();
+    let register = Grant {
+        iss: "renewal-test".into(),
+        aud: AUDIENCE.into(),
+        sub: "node".into(),
+        nbf: start,
+        exp: start + 5,
+        purpose: Purpose::Register,
+        http_request: None,
+        access: None,
+        execution: ExecutionIdentity {
+            namespace: "test".into(),
+            workload: "web".into(),
+            allocation_id: "a".into(),
+            lease_id: "l".into(),
+            generation: 1,
+            node_id: "node".into(),
+        },
+        service: ServiceId {
+            namespace: "test".into(),
+            workload: "web".into(),
+            service: "http".into(),
+        },
+        policy: PolicyRef {
+            issuer: "renewal-test".into(),
+            policy_id: "policy".into(),
+            version: 1,
+            sha256: "ab".repeat(32),
+        },
+    };
+    let route = register.route_id();
+    let stop = CancellationToken::new();
+    let worker_stop = stop.clone();
+    let token = grants::sign(&key, &register).unwrap();
+    let worker = tokio::spawn(async move {
+        edge::connect(
+            &format!("ws://{address}/v1/connect/{route}"),
+            &token,
+            app,
+            worker_stop,
+        )
+        .await
+    });
+    let route = register.route_id();
+    let http = reqwest::Client::new();
+    let mut access = register.clone();
+    access.purpose = Purpose::Access;
+    access.sub = "user".into();
+    access.exp = start + 30;
+    let token = grants::sign(&key, &access).unwrap();
+    for _ in 0..100 {
+        if http
+            .get(format!("http://{address}/v1/ready/{route}"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut stream = http
+        .get(format!("http://{address}/v1/http/{route}/events"))
+        .header("x-trusted-access", &token)
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream();
+    assert!(stream.next().await.unwrap().is_ok());
+    let mut ws_request = format!("ws://{address}/v1/http/{route}/ws")
+        .into_client_request()
+        .unwrap();
+    ws_request
+        .headers_mut()
+        .insert("x-trusted-access", token.parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request).await.unwrap();
+    let renew_url = format!("http://{address}/v1/connect/{route}/renew");
+    let mut next = register.clone();
+    next.exp = start + 20;
+    for invalid in [
+        access.clone(),
+        {
+            let mut g = next.clone();
+            g.sub = "other-node".into();
+            g
+        },
+        {
+            let mut g = next.clone();
+            g.policy.version += 1;
+            g
+        },
+        {
+            let mut g = next.clone();
+            g.execution.namespace = "other-tenant".into();
+            g.service.namespace = "other-tenant".into();
+            g
+        },
+    ] {
+        assert!(http
+            .post(&renew_url)
+            .bearer_auth(grants::sign(&key, &invalid).unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_client_error());
+    }
+    assert_eq!(
+        http.post(&renew_url)
+            .bearer_auth(grants::sign(&key, &next).unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    // Replaying an earlier valid grant cannot shorten the renewed lease.
+    assert_eq!(
+        http.post(&renew_url)
+            .bearer_auth(grants::sign(&key, &register).unwrap())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    let mut short = access.clone();
+    short.exp = start + 3;
+    let mut short_stream = http
+        .get(format!("http://{address}/v1/http/{route}/events"))
+        .header("x-trusted-access", grants::sign(&key, &short).unwrap())
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream();
+    let consume =
+        tokio::spawn(async move { while matches!(short_stream.next().await, Some(Ok(_))) {} });
+    tokio::time::timeout(Duration::from_secs(5), consume)
+        .await
+        .unwrap()
+        .unwrap();
+    while grants::now() <= start + 5 {
+        assert!(tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok());
+    }
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        "after-renewal".into(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        ws.next().await.unwrap().unwrap().into_text().unwrap(),
+        "after-renewal"
+    );
+    let mut revoke = access;
+    revoke.purpose = Purpose::Revoke;
+    assert!(http
+        .delete(format!("http://{address}/v1/revoke/{route}"))
+        .bearer_auth(grants::sign(&key, &revoke).unwrap())
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_success());
+    assert!(http
+        .post(&renew_url)
+        .bearer_auth(grants::sign(&key, &next).unwrap())
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_client_error());
+    stop.cancel();
+    worker.await.unwrap().unwrap();
+    relay_task.abort();
+    app_task.abort();
+}
+
+#[tokio::test]
 async fn fleet_sync_revokes_live_streams_and_fails_closed_on_restart_and_outage() {
     tokio::time::timeout(Duration::from_secs(15), managed_acceptance())
         .await
@@ -127,6 +341,16 @@ async fn managed_acceptance() {
                 let requests = requests.clone();
                 async move {
                     assert_eq!(headers["authorization"], "Bearer router-only");
+                    assert_eq!(
+                        headers["x-fleet-router-capabilities"],
+                        "workload-defaults-v1"
+                    );
+                    // Legacy schedulers still accept the closed JSON shape.
+                    serde_json::from_value::<trusted_router_transport::sync::SyncRequest>(
+                        request.clone(),
+                    )
+                    .unwrap();
+                    assert!(request.get("capabilities").is_none());
                     requests.lock().unwrap().push(request);
                     axum::Json(response.lock().unwrap().clone())
                 }

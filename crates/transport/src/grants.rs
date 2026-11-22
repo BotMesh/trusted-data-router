@@ -1,7 +1,7 @@
 //! Short-lived, purpose-separated Ed25519 capabilities issued by the application's
 //! control gateway. A signature authorizes a route, not arbitrary agent actions.
 use crate::{Error, Result};
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use trusted_contracts::{ExecutionIdentity, PolicyRef, ServiceId};
@@ -15,6 +15,8 @@ pub enum Purpose {
     Register,
     Access,
     Revoke,
+    /// Read-only route availability; cannot open application streams.
+    Probe,
 }
 
 /// A single HTTP invocation approved by the application control plane. The
@@ -103,6 +105,7 @@ impl Grant {
             || self.nbf > clock
             || self.exp <= clock
             || self.exp.saturating_sub(self.nbf) > MAX_LIFETIME
+            || self.purpose == Purpose::Probe && self.exp.saturating_sub(self.nbf) > 30
             || e.generation == 0
             || self.service.namespace != e.namespace
             || self.service.workload != e.workload
@@ -131,13 +134,21 @@ impl Grant {
 
 #[derive(Clone)]
 pub struct Verifier {
-    key: DecodingKey,
+    keys: crate::keys::VerificationKeys,
     pub(crate) issuer: String,
 }
 impl Verifier {
     pub fn new(public_pem: &[u8], issuer: String) -> Result<Self> {
         Ok(Self {
-            key: DecodingKey::from_ed_pem(public_pem).map_err(|_| Error::InvalidContract)?,
+            keys: crate::keys::VerificationKeys::new(public_pem)?,
+            issuer,
+        })
+    }
+    /// Reload the existing bounded public PEM bundle for each new admission.
+    /// Replace it atomically; invalid updates fail closed without retaining keys.
+    pub fn from_file(path: std::path::PathBuf, issuer: String) -> Result<Self> {
+        Ok(Self {
+            keys: crate::keys::VerificationKeys::file(path)?,
             issuer,
         })
     }
@@ -150,9 +161,7 @@ impl Verifier {
         validation.set_issuer(&[&self.issuer]);
         validation.leeway = 0;
         validation.validate_nbf = true;
-        let grant = jsonwebtoken::decode::<Grant>(token, &self.key, &validation)
-            .map_err(|_| Error::Unauthorized)?
-            .claims;
+        let grant: Grant = self.keys.decode(token, &validation)?;
         grant.validate(&self.issuer, purpose, now())?;
         Ok(grant)
     }

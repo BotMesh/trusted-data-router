@@ -67,7 +67,7 @@ async fn acceptance() {
     let digest = "ab".repeat(32);
     let response = Arc::new(Mutex::new(
         json!({"router_id":"relay","issuer":"gateway","epoch":"ab".repeat(16),"from_revision":0,"revision":0,"revoked_routes":[],"lease_seconds":30,
-        "authorization":{"revision":1,"policies":[{"namespace":ns,"workload":"app","service":"http","version":1,"sha256":digest,"enabled":true}],"revoked_subjects":[]}}),
+        "authorization":{"revision":1,"policies":[{"namespace":ns,"workload":"*","service":"http","version":1,"sha256":digest,"enabled":true}],"revoked_subjects":[]}}),
     ));
     let acks = Arc::new(Mutex::new(Vec::<Value>::new()));
     let (control, ctask) = listen(Router::new().route(
@@ -152,6 +152,39 @@ async fn acceptance() {
         policy_version: 1,
         policy_sha256: digest.clone(),
     });
+    // Namespace defaults cover newly scheduled workloads, but an exact deny
+    // wins even when the wildcard version/hash would otherwise match.
+    let mut rules: trusted_router_transport::authorization::AuthorizationState =
+        serde_json::from_value(response.lock().unwrap()["authorization"].clone()).unwrap();
+    assert!(rules.allows(&first));
+    let mut exact = rules.policies[0].clone();
+    exact.workload = "app".into();
+    exact.enabled = false;
+    rules.policies.push(exact);
+    assert!(!rules.allows(&first));
+    let mut foreign = first.clone();
+    foreign.execution.namespace = "cd".repeat(16);
+    assert!(!rules.allows(&foreign));
+    let mut probe = registration.clone();
+    probe.purpose = Purpose::Probe;
+    probe.exp = probe.nbf + 30;
+    let probe_token = grants::sign(&key, &probe).unwrap();
+    let probe_http = reqwest::Client::new();
+    // Probe may inspect an identity-managed route, but cannot carry app bytes.
+    for path in [
+        format!("/v1/http/{route}/events"),
+        format!("/v1/tunnel/{route}"),
+    ] {
+        assert!(probe_http
+            .get(format!("http://{addr}{path}"))
+            .header("x-trusted-access", &probe_token)
+            .bearer_auth(&probe_token)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_client_error());
+    }
     let mut second = first.clone();
     second.access.as_mut().unwrap().session = "bb".repeat(32);
     let mut other = first.clone();
@@ -170,6 +203,7 @@ async fn acceptance() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(ready(&first).send().await.unwrap().status(), 204);
+    assert_eq!(ready(&probe).send().await.unwrap().status(), 204);
     let events = |grant: &Grant| {
         http.get(format!("http://{addr}/v1/http/{route}/events"))
             .header("x-trusted-access", signed(grant))
