@@ -1,0 +1,36 @@
+[package]
+name = "trusted-router-transport"
+description = "Authenticated outbound data transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+trusted-contracts = { git = "https://github.com/BotMesh/trusted-data-router", rev = "5aa93d4be778cf84714954c6d9f28631524610f7" }
+trusted-data-router = { git = "https://github.com/BotMesh/trusted-data-router", rev = "5aa93d4be778cf84714954c6d9f28631524610f7" }
+axum = { version = "0.8", features = ["ws"] }
+bytes = "1"
+futures = "0.3"
+hex = "0.4"
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+jsonwebtoken = "9"
+libc = "0.2"
+pem = "3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
+yamux = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-native-roots"] }
+tower-http = { version = "0.6", features = ["cors"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
