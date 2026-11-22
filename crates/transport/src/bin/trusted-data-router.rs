@@ -4,9 +4,11 @@ use std::{env, path::Path, time::Duration};
 use tokio::{net::TcpListener, signal};
 use tokio_util::sync::CancellationToken;
 use trusted_router_transport::{
+    control::{enroll_node, Gateway, NodeCredential},
     edge,
     grants::{self, Grant, Verifier},
     relay::Relay,
+    sync::ControlClient,
 };
 
 fn file(path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -30,16 +32,43 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match args.first().map(String::as_str) {
         Some("relay") if args.len() == 5 => {
             // relay LISTEN DATABASE PUBLIC_KEY_PEM ISSUER
-            let verifier = Verifier::new(&std::fs::read(&args[3])?, args[4].clone())?;
+            let verifier = Verifier::from_file(Path::new(&args[3]).to_path_buf(), args[4].clone())?;
             let database = Path::new(&args[2]);
             let parent = database.parent().ok_or("missing private state directory")?;
             use std::os::unix::fs::PermissionsExt;
             if std::fs::metadata(parent)?.permissions().mode() & 0o077 != 0 {
                 return Err("state directory must be private".into());
             }
-            Relay::new(verifier, database)?
-                .serve(TcpListener::bind(&args[1]).await?)
-                .await?;
+            let origins: Vec<String> = env::var("TRUSTED_ROUTER_ORIGINS")
+                .unwrap_or_default()
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_owned())
+                .collect();
+            let relay = Relay::new(verifier, database)?;
+            let client = ControlClient::from_env()?;
+            if client.is_none() && relay.requires_control()? {
+                return Err("persisted managed relay requires Fleet control configuration".into());
+            }
+            let listener = TcpListener::bind(&args[1]).await?;
+            if let Some(client) = client {
+                relay.bind_control(&client)?;
+                tokio::select! {
+                    result = relay.clone().serve_with_origins(listener, &origins) => result?,
+                    _ = client.run(relay) => return Err("control synchronization stopped".into()),
+                }
+            } else {
+                relay.serve_with_origins(listener, &origins).await?;
+            }
+        }
+        Some("gateway") if args.len() == 2 => {
+            // Standalone control service, or embed Gateway::router in a backend.
+            let listener = TcpListener::bind(&args[1]).await?;
+            if !listener.local_addr()?.ip().is_loopback() {
+                return Err("use a TLS proxy".into());
+            }
+            let gateway = Gateway::from_env()?.ok_or("missing gateway configuration")?;
+            axum::serve(listener, gateway.router()).await?;
         }
         Some("connect" | "forward") if args.len() == 4 => {
             // connect|forward URL TARGET_OR_LISTEN GRANT_FILE
@@ -75,7 +104,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Some("sign") if args.len() == 2 => {
+        Some("sign" | "enroll-node") if args.len() == 2 => {
             // sign PRIVATE_KEY_PEM; bounded Grant JSON on stdin, JWT on stdout.
             use std::io::Read;
             let mut input = Vec::new();
@@ -83,10 +112,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             if input.len() > 16384 {
                 return Err("grant too large".into());
             }
-            let grant: Grant = serde_json::from_slice(&input)?;
-            println!("{}", grants::sign(&file(&args[1])?, &grant)?);
+            let key = file(&args[1])?;
+            let token = if args[0] == "sign" {
+                grants::sign(&key, &serde_json::from_slice::<Grant>(&input)?)?
+            } else {
+                enroll_node(&key, &serde_json::from_slice::<NodeCredential>(&input)?)?
+            };
+            println!("{token}");
         }
-        _ => return Err("usage: relay|connect|forward|sign".into()),
+        _ => return Err("usage: relay|gateway|connect|forward|sign|enroll-node".into()),
     }
     Ok(())
 }
