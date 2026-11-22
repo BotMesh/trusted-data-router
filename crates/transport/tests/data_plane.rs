@@ -341,9 +341,15 @@ async fn managed_acceptance() {
                 let requests = requests.clone();
                 async move {
                     assert_eq!(headers["authorization"], "Bearer router-only");
-                    assert_eq!(headers["x-fleet-router-capabilities"], "workload-defaults-v1");
+                    assert_eq!(
+                        headers["x-fleet-router-capabilities"],
+                        "workload-defaults-v1"
+                    );
                     // Legacy schedulers still accept the closed JSON shape.
-                    serde_json::from_value::<trusted_router_transport::sync::SyncRequest>(request.clone()).unwrap();
+                    serde_json::from_value::<trusted_router_transport::sync::SyncRequest>(
+                        request.clone(),
+                    )
+                    .unwrap();
                     assert!(request.get("capabilities").is_none());
                     requests.lock().unwrap().push(request);
                     axum::Json(response.lock().unwrap().clone())
