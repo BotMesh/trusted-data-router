@@ -12,7 +12,7 @@ use std::{
 };
 use tokio::net::TcpListener;
 use trusted_router_transport::{
-    control::{enroll_node, Gateway, NodeCredential},
+    control::{enroll_node, Gateway, NodeCredential, REGISTRATION_LIFETIME},
     grants::{self, Purpose, Verifier},
     relay::browser_router,
 };
@@ -63,7 +63,11 @@ async fn control_uses_live_fleet_scope_and_binds_node_and_stateful_clients() {
     ) -> Result<Json<Value>, StatusCode> {
         match headers.get("authorization").and_then(|h| h.to_str().ok()) {
             Some("Bearer film-user" | "Bearer registration-reader" | "Bearer administrator") => {
-                Ok(Json(view.lock().unwrap().clone()))
+                let snapshot = view.lock().unwrap().clone();
+                if let Some(delay) = snapshot["delay_ms"].as_u64() {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                Ok(Json(snapshot))
             }
             _ => Err(StatusCode::FORBIDDEN),
         }
@@ -237,6 +241,8 @@ async fn control_uses_live_fleet_scope_and_binds_node_and_stateful_clients() {
         "edge-a"
     );
     assert!(verifier.verify(token, Purpose::Register).is_err());
+    let access_grant = verifier.verify(token, Purpose::Access).unwrap();
+    assert_eq!(access_grant.exp - access_grant.nbf, 900);
     let node = |name: &str, namespace: &str| {
         enroll_node(
             &key,
@@ -268,6 +274,10 @@ async fn control_uses_live_fleet_scope_and_binds_node_and_stateful_clients() {
             403
         );
     }
+    // Delay a successful Fleet response: its stale time must spend, rather than
+    // extend, the registration lease. Access grants retain their own lifetime.
+    view.lock().unwrap()["delay_ms"] = json!(2100);
+    let checked_at = grants::now();
     let response: Value = http
         .post(format!("{base}v1/runtime/registration"))
         .bearer_auth(node("edge-a", "film"))
@@ -283,7 +293,43 @@ async fn control_uses_live_fleet_scope_and_binds_node_and_stateful_clients() {
     let register = verifier
         .verify(response["token"].as_str().unwrap(), Purpose::Register)
         .unwrap();
+    view.lock().unwrap()["delay_ms"] = json!(0);
+    assert_eq!(register.exp - register.nbf, REGISTRATION_LIFETIME);
+    assert!(register.nbf <= checked_at + 1);
+    assert!(register.exp <= checked_at + 1 + REGISTRATION_LIFETIME);
+    assert!(register.exp - grants::now() < REGISTRATION_LIFETIME);
     assert_eq!(register.route_id(), connections[0]["route_id"]);
+    view.lock().unwrap()["runtime_instances"][0]["ready"] = json!(false);
+    assert_eq!(
+        http.post(format!("{base}v1/runtime/registration"))
+            .bearer_auth(node("edge-a", "film"))
+            .json(&registration)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    view.lock().unwrap()["runtime_instances"][0]["ready"] = json!(true);
+    let recovered: Value = http
+        .post(format!("{base}v1/runtime/registration"))
+        .bearer_auth(node("edge-a", "film"))
+        .json(&registration)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        verifier
+            .verify(recovered["token"].as_str().unwrap(), Purpose::Register)
+            .unwrap()
+            .route_id(),
+        register.route_id()
+    );
     let route = connections[0]["route_id"].clone();
     let renewal = json!({"service":service,"route_id":route});
     assert_eq!(

@@ -24,6 +24,10 @@ use trusted_data_router::ServiceSpec;
 const NODE_AUDIENCE: &str = "trusted-runtime-node/v1";
 const NODE_LIFETIME: u64 = 30 * 86400;
 const GRANT_LIFETIME: u64 = 900;
+/// A renewable node transport lease, independent of application Access expiry.
+/// Fleet readiness must be rechecked before each renewal. Existing streams are
+/// drained by the relay at expiry even if the node stops contacting the gateway.
+pub const REGISTRATION_LIFETIME: u64 = 30;
 
 /// An operator enrolls a node after verifying its Fleet identity. This is a
 /// bootstrap credential, not a TEE attestation. Keep it outside the workload.
@@ -651,6 +655,9 @@ impl Gateway {
             .get(&request.execution.namespace)
             .unwrap_or(&self.registration_token_file);
         let token = String::from_utf8(private_file(path)?).map_err(|_| Error::InvalidContract)?;
+        // Include the Fleet round trip in the lease, so a delayed readiness
+        // response cannot buy a fresh full lease after authority has been lost.
+        let checked_at = grants::now();
         if !self
             .instances(token.trim(), &request.service.id)
             .await?
@@ -659,15 +666,15 @@ impl Gateway {
         {
             return Err(Error::Unauthorized);
         }
-        grants::sign(
-            &self.checked_signing_key()?,
-            &self.grant(
-                request.execution.clone(),
-                request.service.id.clone(),
-                Purpose::Register,
-                node.sub,
-            ),
-        )
+        let mut grant = self.grant(
+            request.execution.clone(),
+            request.service.id.clone(),
+            Purpose::Register,
+            node.sub,
+        );
+        grant.nbf = checked_at;
+        grant.exp = checked_at + REGISTRATION_LIFETIME;
+        grants::sign(&self.checked_signing_key()?, &grant)
     }
 }
 

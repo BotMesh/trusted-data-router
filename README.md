@@ -112,6 +112,17 @@ trusted-data-router connect wss://relay.example/v1/connect/ROUTE_ID 127.0.0.1:18
 Grant files must be private regular files (0600). Replace the registration file
 atomically before expiry; reconnect rereads it. Connection loss closes in-flight
 streams; reconnect uses bounded exponential backoff and never replays a request.
+The embedded gateway issues registration leases for 30 seconds from the start of
+each live Fleet readiness check. Shim renews them on the same transport before
+expiry; healthy renewal preserves HTTP/SSE/WebSocket streams. If Fleet no longer
+publishes the exact service, or the gateway is unreachable, the last lease expires
+and the relay drains all streams even when application Access tokens remain valid
+(up to 900 seconds). With Fleet's five-second native gateway observation cache,
+native readiness loss can take about 35 seconds to drain, plus timer/clock skew.
+Synchronize gateway and relay clocks. Transient loss does not create a permanent
+route revocation; recovery reconnects the same execution without replaying work.
+Roll out the gateway before relying on this bound: older issuers' existing longer
+leases retain their signed expiry, including through an earlier short renewal.
 The caller must supervise the connector for the allocation's lifetime. Stop it
 and revoke its route before releasing/reusing the runtime's local endpoint.
 
