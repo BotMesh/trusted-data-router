@@ -573,10 +573,18 @@ async fn open(session: &Session) -> std::result::Result<yamux::Stream, StatusCod
         .open
         .try_send(tx)
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    tokio::time::timeout(Duration::from_secs(15), rx)
-        .await
-        .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let mut stream = rx.await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        // Yamux opens outbound streams lazily. Queue its empty SYN frame so
+        // server-first protocols reach the target without client payload. Do
+        // not use write_all: an empty slice would skip poll_write entirely.
+        futures::AsyncWriteExt::write(&mut stream, &[])
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        Ok(stream)
+    })
+    .await
+    .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
 }
 pub(crate) async fn expires(exp: u64) {
     tokio::time::sleep(Duration::from_secs(exp.saturating_sub(grants::now()))).await;

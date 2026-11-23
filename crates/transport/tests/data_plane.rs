@@ -710,6 +710,82 @@ async fn managed_acceptance() {
     app_task.abort();
 }
 
+async fn server_first_tcp(address: std::net::SocketAddr, key: &[u8], template: &Grant) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut grant = template.clone();
+    grant.service.service = "banner".into();
+    grant.purpose = Purpose::Register;
+    let token = grants::sign(key, &grant).unwrap();
+    let route = grant.route_id();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    let app = tokio::spawn(async move {
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        tcp.write_all(b"SSH-2.0-fixture\r\n").await.unwrap();
+        let mut bytes = [0; 4];
+        tcp.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"ping"); // tunnel setup must inject no application bytes
+        tcp.write_all(&bytes).await.unwrap();
+    });
+    let stop = CancellationToken::new();
+    let connector = tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            edge::connect(
+                &format!("ws://{address}/v1/connect/{route}"),
+                &token,
+                target,
+                stop,
+            )
+            .await
+        }
+    });
+    grant.purpose = Purpose::Access;
+    let token = grants::sign(key, &grant).unwrap();
+    let http = reqwest::Client::new();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if http
+                .get(format!("http://{address}/v1/ready/{}", grant.route_id()))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                == 204
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = listener.local_addr().unwrap();
+    let forward = tokio::spawn(edge::forward(
+        listener,
+        format!("ws://{address}/v1/tunnel/{}", grant.route_id()),
+        token,
+        stop.clone(),
+    ));
+    let mut tcp = tokio::net::TcpStream::connect(local).await.unwrap();
+    let mut banner = [0; 17];
+    tokio::time::timeout(Duration::from_secs(3), tcp.read_exact(&mut banner))
+        .await
+        .expect("server-first protocols must not wait for client bytes")
+        .unwrap();
+    assert_eq!(&banner, b"SSH-2.0-fixture\r\n");
+    tcp.write_all(b"ping").await.unwrap();
+    let mut response = [0; 4];
+    tcp.read_exact(&mut response).await.unwrap();
+    assert_eq!(&response, b"ping");
+    app.await.unwrap();
+    stop.cancel();
+    forward.await.unwrap().unwrap();
+    connector.await.unwrap().unwrap();
+}
+
 async fn acceptance() {
     let temp = tempfile::tempdir().unwrap();
     let key_path = temp.path().join("private.pem");
@@ -798,6 +874,7 @@ async fn acceptance() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let relay_task = tokio::spawn(relay.serve(listener));
+    server_first_tcp(address, &key, &grant).await;
     let (app, app_task, accepts) = application().await;
     let http = reqwest::Client::new();
     let ready_url = format!("http://{address}/v1/ready/{route}");
