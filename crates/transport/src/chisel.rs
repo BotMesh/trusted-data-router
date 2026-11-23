@@ -90,6 +90,9 @@ struct Request {
 /// One helper process hosting isolated upstream SSH domains for each lease.
 pub struct Broker {
     requests: mpsc::Sender<Request>,
+    // Removals are unbounded so a burst of lease drops can never be refused:
+    // each lease sends exactly once, so the queue is bounded by live leases.
+    removals: mpsc::UnboundedSender<String>,
     stopped: CancellationToken,
 }
 
@@ -106,13 +109,20 @@ impl Broker {
             return Err(Error::Unavailable);
         }
         let (requests, mut receive) = mpsc::channel::<Request>(128);
+        let (removals, mut removed) = mpsc::unbounded_channel::<String>();
         let stopped = CancellationToken::new();
         let stop = stopped.clone();
         tokio::spawn(async move {
             loop {
+                // Withdraw authority before granting more of it.
                 let request = tokio::select! {
+                    biased;
                     _ = stop.cancelled() => break,
                     _ = process.child.wait() => break,
+                    Some(user) = removed.recv() => Request {
+                        body: json!({"op": "remove", "user": user}),
+                        reply: None,
+                    },
                     request = receive.recv() => match request { Some(r) => r, None => break },
                 };
                 // Finish each exchange even if its caller disconnects. An
@@ -141,7 +151,11 @@ impl Broker {
             stop.cancel();
             let _ = process.child.kill().await;
         });
-        Ok(Arc::new(Self { requests, stopped }))
+        Ok(Arc::new(Self {
+            requests,
+            removals,
+            stopped,
+        }))
     }
 
     pub fn stopped(&self) -> CancellationToken {
@@ -200,16 +214,8 @@ impl Lease {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        if self
-            .server
-            .requests
-            .try_send(Request {
-                body: json!({"op": "remove", "user": self.user}),
-                reply: None,
-            })
-            .is_err()
-        {
-            // Dropping a lease may never silently retain authority under load.
+        if self.server.removals.send(self.user.clone()).is_err() {
+            // The helper loop is gone; make sure its process is too.
             self.server.stopped.cancel();
         }
     }

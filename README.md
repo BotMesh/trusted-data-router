@@ -223,6 +223,12 @@ server identity, verifies WSS certificates, and installs exact address ACLs. A
 permanent deny-only user prevents upstream's empty user table from disabling
 authentication. Control-channel failure kills the server; client drop kills its
 process. Deleting a user alone still does **not** close an established tunnel.
+Lease removals use their own unbounded, priority queue (bounded by live leases),
+so a burst of expiring enrollments cannot stop the shared helper. If the helper
+fails, its sessions drain on its stop token and `relay` starts a replacement with
+capped backoff; only the initial start is fatal. Reverse ports stay reserved until
+every holder of their session is gone, so a port released by a dying tunnel is never
+handed to another tenant's lease.
 
 Each enrollment uses an isolated native SSH server inside one helper process,
 preventing credentials for another lease from authenticating through its HTTP
@@ -232,9 +238,10 @@ upstream Chisel owns SSH multiplexing, WSS transport and keepalive.
 Local evidence includes Go race tests, wrong-domain credential rejection, binary
 traffic, half-close, registration renewal and Fleet revocation. Isolated Linux
 NAT tests passed with two overlapping private networks, outbound TCP/443 only,
-40-second idle continuity, blackhole cleanup and recovery without replay. The
-new strict attach test above remains failing; full cross-machine application
-acceptance and deployment validation remain open.
+40-second idle continuity, blackhole cleanup and recovery without replay, plus
+unmodified ssh/rsync (upload, verified resume, download) from a client behind its
+own NAT. Full cross-machine application acceptance and deployment validation
+remain open.
 
 Build outside the source tree and run the process acceptance:
 
@@ -288,7 +295,8 @@ credentials, remote cluster or local prover is used.
 Optional network acceptance uses the actual router executable:
 
 ```sh
-# Linux, passwordless sudo, iproute2, iptables, openssl, Python >=3.11 + aiohttp.
+# Linux, passwordless sudo, iproute2, iptables, openssl, OpenSSH, rsync,
+# Python >=3.11 + aiohttp. Add --tunnel-binary /absolute/helper for Chisel.
 python tools/test_nat.py --router-binary /path/to/trusted-data-router \
   --artifacts /private/artifacts/nat-test
 # Authorized nonproduction SSH host, Python venv there; cloudflared locally.
@@ -296,12 +304,15 @@ python tools/test_remote.py --ssh-host test-node --router-binary /path/to/truste
   --artifacts /private/artifacts/remote-test
 ```
 
-The NAT test uses five isolated network namespaces and two stateful NATs with
-overlapping node addresses. Only outbound TCP/443 is allowed. It checks blocked
+The NAT test uses nine isolated network namespaces and four stateful NATs with
+overlapping private addresses. Only outbound TCP/443 is allowed. It checks blocked
 new inbound connections, TLS trust/hostname rejection, tenant and application-key
 isolation, idle continuity through a 25-second proxy timeout, silent network loss,
-SSE/WS drain, unaffected peer traffic and recovery without request replay. It
-changes no host firewall or routes and removes its namespaces afterward.
+SSE/WS drain, unaffected peer traffic and recovery without request replay. An
+unprivileged sshd behind one NAT is reached only through the access tunnel by
+`trusted-data-router forward` behind another, with host-key-verified ssh, rsync
+upload, `--append-verify` resume and download, and another tenant's grant is
+rejected. It changes no host firewall or routes and removes its namespaces afterward.
 
 The remote test installs a private, self-expiring fixture on the specified SSH
 host. SSH carries setup/cleanup only; application traffic uses an outgoing WSS

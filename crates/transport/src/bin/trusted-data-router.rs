@@ -47,9 +47,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             let relay = Relay::new(verifier, database)?;
             if let Some(binary) = env::var_os("TRUSTED_ROUTER_TUNNEL_BINARY") {
-                relay.enable_chisel(
-                    trusted_router_transport::chisel::Broker::start(Path::new(&binary)).await?,
-                )?;
+                // A helper that fails later is restarted; only startup is fatal.
+                tokio::spawn(relay.clone().supervise_chisel(binary.into()).await?);
             }
             let client = ControlClient::from_env()?;
             if client.is_none() && relay.requires_control()? {

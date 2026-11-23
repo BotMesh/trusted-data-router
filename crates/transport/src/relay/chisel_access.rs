@@ -33,11 +33,8 @@ pub(super) async fn enroll(State(relay): State<Arc<Relay>>, req: Request) -> Htt
     }
     let node = relay.session(&grant)?;
     let access = relay.track_access(&grant, &node)?;
-    let broker = relay.chisel.get().ok_or(StatusCode::NOT_IMPLEMENTED)?;
+    let broker = relay.chisel_broker()?;
     let stopped = broker.stopped();
-    if stopped.is_cancelled() {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
     let mut listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;

@@ -221,3 +221,34 @@ async fn acceptance() {
     task_a.abort();
     task_b.abort();
 }
+
+#[tokio::test]
+#[ignore = "requires TRUSTED_ROUTER_TUNNEL_BINARY built from tunnel/chisel"]
+async fn lease_drop_storm_neither_stops_the_broker_nor_retains_authority() {
+    let binary = PathBuf::from(
+        std::env::var_os("TRUSTED_ROUTER_TUNNEL_BINARY").expect("build the pinned helper first"),
+    );
+    let server = Broker::start(&binary).await.unwrap();
+    let mut leases = Vec::new();
+    for _ in 0..600 {
+        leases.push(server.authorize(unused().await, false).await.unwrap());
+    }
+    let addresses: Vec<_> = leases.iter().map(|l| l.address).collect();
+    // Many sessions expiring together, e.g. abandoned enrollments, must not
+    // take every tenant's helper down with them.
+    drop(leases);
+    let survivor = tokio::time::timeout(
+        Duration::from_secs(20),
+        server.authorize(unused().await, false),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!server.stopped().is_cancelled());
+    // Every dropped lease's private SSH server is closed by then: removals
+    // are drained before any later authorization.
+    for address in addresses {
+        assert!(TcpStream::connect(address).await.is_err());
+    }
+    drop(survivor);
+}

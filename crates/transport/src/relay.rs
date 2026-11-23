@@ -16,9 +16,9 @@ use futures::future::poll_fn;
 use hyper_util::rt::TokioIo;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -126,8 +126,10 @@ pub struct Relay {
     storage_slot: Arc<Semaphore>,
     serial: AtomicU64,
     watchdog_started: AtomicBool,
-    chisel: std::sync::OnceLock<Arc<crate::chisel::Broker>>,
+    chisel: Mutex<Option<Arc<crate::chisel::Broker>>>,
     chisel_access: Mutex<HashMap<String, Arc<chisel_access::ClientSession>>>,
+    // Reverse loopback ports still referenced by a live Chisel session.
+    reverse_ports: Mutex<HashSet<u16>>,
 }
 
 impl Relay {
@@ -159,15 +161,65 @@ impl Relay {
             storage_slot: Arc::new(Semaphore::new(1)),
             serial: AtomicU64::new(1),
             watchdog_started: AtomicBool::new(false),
-            chisel: std::sync::OnceLock::new(),
+            chisel: Mutex::new(None),
             chisel_access: Mutex::new(HashMap::new()),
+            reverse_ports: Mutex::new(HashSet::new()),
         }))
     }
-    /// Install the upstream backend before serving requests.
+    /// Install the upstream backend. A live broker is never replaced; a stopped
+    /// one may be, and its sessions have already drained on its stop token.
     pub fn enable_chisel(&self, broker: Arc<crate::chisel::Broker>) -> crate::Result<()> {
-        self.chisel
-            .set(broker)
-            .map_err(|_| crate::Error::InvalidContract)
+        let mut current = self.chisel.lock().map_err(|_| crate::Error::Unavailable)?;
+        if current
+            .as_ref()
+            .is_some_and(|b| !b.stopped().is_cancelled())
+        {
+            return Err(crate::Error::InvalidContract);
+        }
+        *current = Some(broker);
+        Ok(())
+    }
+    pub(crate) fn chisel_broker(
+        &self,
+    ) -> std::result::Result<Arc<crate::chisel::Broker>, StatusCode> {
+        let broker = self
+            .chisel
+            .lock()
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .clone()
+            .ok_or(StatusCode::NOT_IMPLEMENTED)?;
+        if broker.stopped().is_cancelled() {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        Ok(broker)
+    }
+    /// Start the helper, then restart it with capped backoff whenever it stops.
+    /// Only the first start can fail; afterwards Chisel requests answer 503
+    /// until a replacement is installed, while legacy transports are unaffected.
+    pub async fn supervise_chisel(
+        self: Arc<Self>,
+        binary: PathBuf,
+    ) -> crate::Result<impl std::future::Future<Output = ()>> {
+        let broker = crate::chisel::Broker::start(&binary).await?;
+        self.enable_chisel(broker.clone())?;
+        Ok(async move {
+            let mut stopped = broker.stopped();
+            let mut delay = Duration::from_millis(250);
+            loop {
+                stopped.cancelled().await;
+                loop {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(30));
+                    if let Ok(broker) = crate::chisel::Broker::start(&binary).await {
+                        if self.enable_chisel(broker.clone()).is_ok() {
+                            stopped = broker.stopped();
+                            delay = Duration::from_millis(250);
+                            break;
+                        }
+                    }
+                }
+            }
+        })
     }
     /// Serialize durable transitions off the async workers. The closure owns
     /// the permit through commit and publication even if its caller disconnects.

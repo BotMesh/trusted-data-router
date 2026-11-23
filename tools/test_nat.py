@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Real TLS/WSS acceptance behind two isolated stateful NATs (Linux, sudo, aiohttp).
+"""Real TLS/WSS acceptance behind isolated stateful NATs (Linux, sudo, aiohttp, OpenSSH, rsync).
+
+Two HTTP tenants and an SSH node each sit behind their own NAT; a separate
+SSH client behind a fourth NAT reaches that node only through the Router's
+access tunnel, using unmodified ssh/rsync with host-key verification.
 
 Only test-owned network namespaces are changed. No host routes, firewall rules,
 listeners, production credentials or proof services are used. Generated keys and
@@ -221,6 +225,47 @@ async def check(root, config):
                 await socket.close()
 
 
+SSH_OPTIONS = ['-F', '/dev/null', '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes',
+               '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=20']
+
+
+def ssh_check(root, config):
+    """Runs inside the client namespace: every byte crosses its NAT and WSS."""
+    ssh = root / 'ssh'
+    options = [*SSH_OPTIONS, '-i', str(ssh / 'user'), '-o', 'UserKnownHostsFile=' + str(ssh / 'known_hosts')]
+
+    def remote(port, *command, check=True):
+        return subprocess.run(['ssh', *options, '-p', str(port), '127.0.0.1', *command],
+                              capture_output=True, timeout=60, check=check)
+
+    deadline = time.monotonic() + 45
+    while remote(2222, 'echo', 'through-nat', check=False).stdout != b'through-nat\n':
+        assert time.monotonic() < deadline, 'ssh through the access tunnel never became ready'
+        time.sleep(.5)
+    shell = 'ssh ' + ' '.join(options + ['-p', '2222'])
+    blob, copy, back = root / 'blob', ssh / 'remote' / 'blob', root / 'blob.back'
+    blob.write_bytes(os.urandom(8 << 20))
+    digest = hashlib.sha256(blob.read_bytes()).hexdigest()
+    run('rsync', '-a', '-e', shell, blob, '127.0.0.1:' + str(copy))
+    assert hashlib.sha256(copy.read_bytes()).hexdigest() == digest
+    # An interrupted transfer resumes instead of restarting, and is verified.
+    with copy.open('r+b') as partial:
+        partial.truncate(3 << 20)
+    stats = run('rsync', '-a', '--partial', '--append-verify', '--stats', '-e', shell, blob, '127.0.0.1:' + str(copy)).stdout.decode()
+    literal = int(next(line for line in stats.splitlines() if line.startswith('Literal data:')).split()[2].replace(',', ''))
+    assert literal <= 5 << 20, f'resume resent {literal} bytes instead of only the missing tail'
+    assert hashlib.sha256(copy.read_bytes()).hexdigest() == digest
+    run('rsync', '-a', '-e', shell, '127.0.0.1:' + str(copy), back)
+    assert hashlib.sha256(back.read_bytes()).hexdigest() == digest
+    print('PASS: unmodified ssh/rsync (upload, verified resume, download) through client NAT, WSS and access tunnel', flush=True)
+    # Another tenant's valid access grant cannot open this route.
+    assert remote(2223, 'true', check=False).returncode != 0
+    accepted = (root / 'ssh-sshd.log').read_text().count('Accepted publickey')
+    peers = [json.loads(line) for line in (root / 'peers.jsonl').read_text().splitlines()]
+    assert peers.count(config['ssh_client']['outside']), 'client traffic did not traverse its NAT'
+    print(f'PASS: foreign grant rejected on the SSH route; {accepted} authenticated sessions, all via the client NAT', flush=True)
+
+
 async def probe(host, port, expect_open=False):
     try:
         _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), .8)
@@ -267,7 +312,7 @@ def acceptance(binary, python, root, tunnel_binary=None):
         namespace(central)
         network('netns', 'exec', central, 'sysctl', '-qw', 'net.ipv4.ip_unprivileged_port_start=443')
         tenants = []
-        for i, name in enumerate(['film', 'clawup'], 1):
+        for i, name in enumerate(['film', 'clawup', 'ssh', 'client'], 1):
             nat, edge = prefix + '-nat' + str(i), prefix + '-edge' + str(i)
             namespace(nat)
             namespace(edge)
@@ -289,7 +334,8 @@ def acceptance(binary, python, root, tunnel_binary=None):
             '-addext', 'basicConstraints=critical,CA:TRUE', '-keyout', root / 'ca.key', '-out', root / 'ca.pem')
         run('openssl', 'req', '-new', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=NAT acceptance',
             '-keyout', root / 'server.key', '-out', root / 'server.csr')
-        extensions = private(root / 'extensions', 'subjectAltName=IP:10.82.1.2,IP:10.82.2.2\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n')
+        extensions = private(root / 'extensions', 'subjectAltName=' + ','.join(f'IP:{t["central"]}' for t in tenants)
+                             + '\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n')
         run('openssl', 'x509', '-req', '-in', root / 'server.csr', '-CA', root / 'ca.pem', '-CAkey', root / 'ca.key',
             '-CAcreateserial', '-days', '1', '-extfile', extensions, '-out', root / 'server.pem')
         key, public = root / 'signing.pem', root / 'public.pem'
@@ -297,9 +343,10 @@ def acceptance(binary, python, root, tunnel_binary=None):
         key.chmod(0o600)
         run('openssl', 'pkey', '-in', key, '-pubout', '-out', public)
         public.chmod(0o644)
-        for tenant in tenants:
+        tenants, (ssh_node, ssh_client) = tenants[:2], tenants[2:]
+        for tenant in [*tenants, ssh_node]:
             execution = dict(namespace=tenant['name'], workload='app', allocation_id='one', lease_id='first', generation=1, node_id=tenant['edge'])
-            service = dict(namespace=tenant['name'], workload='app', service='http')
+            service = dict(namespace=tenant['name'], workload='app', service='ssh' if tenant is ssh_node else 'http')
             grant = dict(iss='nat-test', aud='trusted-data-router/v1', sub=tenant['edge'], nbf=int(time.time()), exp=int(time.time()) + 600,
                          purpose='register', execution=execution, service=service,
                          policy=dict(issuer='nat-test', policy_id='fixture', version=1, sha256='ab' * 32))
@@ -307,13 +354,32 @@ def acceptance(binary, python, root, tunnel_binary=None):
             private(root / (tenant['name'] + '.jwt'), run(binary, 'sign', key, input=json.dumps(grant).encode()).stdout.decode().strip())
             grant.update(purpose='access', sub=tenant['name'] + '-user')
             tenant['access'] = run(binary, 'sign', key, input=json.dumps(grant).encode()).stdout.decode().strip()
-        private(root / 'config.json', json.dumps(dict(tenants=tenants, inbound_canary=True)))
+        ssh = root / 'ssh'
+        (ssh / 'remote').mkdir(mode=0o700, parents=True)
+        run('ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', ssh / 'host')
+        run('ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', ssh / 'user')
+        private(ssh / 'authorized_keys', (ssh / 'user.pub').read_text())
+        private(ssh / 'known_hosts', '[127.0.0.1]:2222 ' + (ssh / 'host.pub').read_text())
+        private(ssh / 'sshd_config', '\n'.join([
+            'Port 2022', 'ListenAddress 127.0.0.1', f'HostKey {ssh}/host', f'PidFile {ssh}/sshd.pid',
+            f'AuthorizedKeysFile {ssh}/authorized_keys', 'PasswordAuthentication no',
+            'KbdInteractiveAuthentication no', 'UsePAM no', 'StrictModes no',
+            'AllowUsers ' + run('id', '-un').stdout.decode().strip(), '']))
+        private(root / 'ssh-access.jwt', ssh_node['access'])
+        private(root / 'foreign-access.jwt', tenants[0]['access'])
+        private(root / 'config.json', json.dumps(dict(tenants=tenants, ssh_node=ssh_node, ssh_client=ssh_client, inbound_canary=True)))
         spawn(central, 'relay', binary, 'relay', '127.0.0.1:8080', root / 'router.sqlite', public, 'nat-test')
         spawn(central, 'proxy', python, script, '--component', 'proxy', '--artifacts', root)
         for i, tenant in enumerate(tenants):
             spawn(tenant['edge'], tenant['name'] + '-app', python, script, '--component', 'app', '--index', i, '--artifacts', root)
             spawn(tenant['edge'], tenant['name'] + '-connector', binary, 'connect',
                   'wss://' + tenant['central'] + '/v1/connect/' + tenant['route'], '127.0.0.1:8090', root / (tenant['name'] + '.jwt'))
+        spawn(ssh_node['edge'], 'ssh-sshd', '/usr/sbin/sshd', '-D', '-e', '-f', ssh / 'sshd_config')
+        spawn(ssh_node['edge'], 'ssh-connector', binary, 'connect',
+              'wss://' + ssh_node['central'] + '/v1/connect/' + ssh_node['route'], '127.0.0.1:2022', root / 'ssh.jwt')
+        tunnel = 'wss://' + ssh_client['central'] + '/v1/tunnel/' + ssh_node['route']
+        spawn(ssh_client['edge'], 'ssh-forward', binary, 'forward', tunnel, '127.0.0.1:2222', root / 'ssh-access.jwt')
+        spawn(ssh_client['edge'], 'foreign-forward', binary, 'forward', tunnel, '127.0.0.1:2223', root / 'foreign-access.jwt')
         time.sleep(2)
         assert all(child.poll() is None for child in processes), 'test process failed; inspect private artifact logs'
         for i, tenant in enumerate(tenants, 1):
@@ -321,11 +387,18 @@ def acceptance(binary, python, root, tunnel_binary=None):
             network('-n', central, 'route', 'replace', '10.83.0.0/24', 'via', tenant['outside'], 'dev', 'wan' + str(i))
             run(*command(central, python, script, '--component', 'probe', '--host', '10.83.0.2', '--port', 8091))
             run(*command(tenant['edge'], python, script, '--component', 'probe', '--host', tenant['central'], '--port', 80))
+        for tenant in (ssh_node, ssh_client):
+            run(*command(tenant['edge'], python, script, '--component', 'probe', '--host', tenant['central'], '--port', 80))
         print('PASS: new inbound connections blocked; nodes only allow outbound TCP/443, no UDP', flush=True)
         # Keep diagnostics in the private directory; only assertions/status go to stdout.
         result = subprocess.run(command(central, python, script, '--component', 'check', '--artifacts', root),
                                 capture_output=True, timeout=180)
         private(root / 'check.log', (result.stdout + result.stderr).decode(errors='replace'))
+        result.check_returncode()
+        print(result.stdout.decode(), end='', flush=True)
+        result = subprocess.run(command(ssh_client['edge'], python, script, '--component', 'ssh', '--artifacts', root),
+                                capture_output=True, timeout=240)
+        private(root / 'ssh-check.log', (result.stdout + result.stderr).decode(errors='replace'))
         result.check_returncode()
         print(result.stdout.decode(), end='', flush=True)
     finally:
@@ -353,7 +426,7 @@ def main():
     parser.add_argument('--tunnel-binary', type=Path, help='Use the pinned upstream Chisel adapter')
     parser.add_argument('--python', type=Path, default=Path(sys.executable))
     parser.add_argument('--artifacts', type=Path)
-    parser.add_argument('--component', choices=['app', 'proxy', 'check', 'probe'])
+    parser.add_argument('--component', choices=['app', 'proxy', 'check', 'probe', 'ssh'])
     parser.add_argument('--index', type=int, default=0)
     parser.add_argument('--host')
     parser.add_argument('--port', type=int)
@@ -365,6 +438,9 @@ def main():
     if args.component:
         root = args.artifacts
         config = json.loads((root / 'config.json').read_text())
+        if args.component == 'ssh':
+            ssh_check(root, config)
+            return
         asyncio.run(app(config, args.index) if args.component == 'app' else
                     proxy(root) if args.component == 'proxy' else check(root, config))
         return

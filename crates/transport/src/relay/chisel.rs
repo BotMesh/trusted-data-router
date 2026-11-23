@@ -6,10 +6,56 @@ use tokio::net::TcpStream;
 pub(super) struct Connection {
     lease: crate::chisel::Lease,
     pub reverse_address: SocketAddr,
+    _port: PortClaim,
     reservation: Mutex<Option<TcpListener>>,
     claimed: AtomicBool,
     pub ready: AtomicBool,
     confirmed: Notify,
+}
+
+/// Keeps a reverse port out of new leases until every holder of its session,
+/// including in-flight access streams, is gone. Otherwise the kernel may hand
+/// a port released by a dying tunnel to another tenant's reverse listener.
+struct PortClaim {
+    relay: std::sync::Weak<Relay>,
+    port: u16,
+}
+impl Drop for PortClaim {
+    fn drop(&mut self) {
+        if let Some(relay) = self.relay.upgrade() {
+            if let Ok(mut ports) = relay.reverse_ports.lock() {
+                ports.remove(&self.port);
+            }
+        }
+    }
+}
+
+async fn reserve(relay: &Arc<Relay>) -> std::result::Result<(TcpListener, PortClaim), StatusCode> {
+    // Keep rejected listeners bound so the kernel cannot offer them again.
+    let mut rejected = Vec::new();
+    for _ in 0..16 {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let port = listener
+            .local_addr()
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .port();
+        if relay
+            .reverse_ports
+            .lock()
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+            .insert(port)
+        {
+            let claim = PortClaim {
+                relay: Arc::downgrade(relay),
+                port,
+            };
+            return Ok((listener, claim));
+        }
+        rejected.push(listener);
+    }
+    Err(StatusCode::SERVICE_UNAVAILABLE)
 }
 
 #[derive(Serialize)]
@@ -22,18 +68,9 @@ struct Offer<'a> {
 
 pub(super) async fn enroll(State(relay): State<Arc<Relay>>, req: Request) -> HttpResult {
     let grant = relay.authenticate(&req, Purpose::Register)?;
-    let broker = relay
-        .chisel
-        .get()
-        .ok_or(StatusCode::NOT_IMPLEMENTED)?
-        .clone();
+    let broker = relay.chisel_broker()?;
     let stopped = broker.stopped();
-    if stopped.is_cancelled() {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    }
-    let reservation = TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let (reservation, port) = reserve(&relay).await?;
     let address = reservation
         .local_addr()
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -56,6 +93,7 @@ pub(super) async fn enroll(State(relay): State<Arc<Relay>>, req: Request) -> Htt
         backend: Backend::Chisel(Box::new(Connection {
             lease,
             reverse_address: address,
+            _port: port,
             reservation: Mutex::new(Some(reservation)),
             claimed: AtomicBool::new(false),
             ready: AtomicBool::new(false),
