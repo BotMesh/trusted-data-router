@@ -181,15 +181,48 @@ attestation; those proofs and OpenShell enforcement belong in rail/shim.
 
 ## Reuse and integration
 
-The transport directly composes established Rust protocols/libraries. It defines
-no custom multiplexing or cryptographic protocol. The initial framework also
-evaluated [rathole](https://github.com/rathole-org/rathole) and Pingora.
+The current transport composes Rust protocol libraries; it has not yet integrated
+an upstream tunnel service. Prefer reusing that service while retaining Fleet
+admission, exact-instance routing and per-connection revocation in this router.
 
-Rathole 0.5.0's TCP data path spawns established forwarding tasks separately from
-the listener shutdown path. Config removal alone must therefore NOT be assumed to
-close active streams. Adapter selection requires an explicit revocation test;
-process isolation or another supported transport may be necessary. No upstream
-fork is proposed here.
+[`tools/test_upstream_tunnels.py`](tools/test_upstream_tunnels.py) compares unmodified
+upstream binaries with two loopback services, verified WSS certificates, 512 KiB
+binary transfers, EOF-dependent responses, configuration removal and process stop.
+Results on 2026-11-23:
+
+| Transport | Binary transfer | TCP half-close | Config removal stops new connections | Closes existing streams |
+|---|---|---|---|---|
+| rathole 0.5.0, TCP | pass | pass | yes | no |
+| rathole 0.5.0, WSS | pass | fail | yes | no |
+| frp 0.72.0, WSS | pass | fail | yes | no |
+| Chisel 1.12.0, WSS | pass | pass | no | no |
+| Chisel 1.13.0 prerelease, WSS | pass | pass | no | no |
+
+The rathole source is pinned at `a292f7ed5402f840415fc6a53827da2f34337856`;
+frp and Chisel use checksum-verified official release binaries. The frp test
+uses a TLS-terminating ingress in front of its plain WebSocket listener. For
+Chisel, removal means narrowing the authfile on a connected reverse tunnel;
+it does not remove that tunnel's existing listener. Stopping a shared client
+closes both services, so it is not selective tenant revocation.
+
+Chisel 1.12.0 is the preferred next transport candidate from these results: it
+preserves TCP half-close over WSS. It is Go, so use its stock executable rather
+than rewriting it in Rust. This is **not an implemented backend or migration
+approval**. The adapter must keep reverse listeners private, verify server
+identity, constrain each enrollment's listeners and local targets, and close
+streams at the router's authorization boundary on revocation or lease expiry.
+Test malicious route registration, isolated NAT/reconnect, HTTP/SSE/WebSocket,
+real SSH/rsync and unchanged app credentials before replacing the current path.
+These local transport tests do not establish tenant authorization or NAT behavior.
+
+```sh
+python3 tools/test_upstream_tunnels.py \
+  --rathole /absolute/path/rathole --frp-dir /absolute/path/frp \
+  --chisel /absolute/path/chisel --artifacts /private/external/new-directory
+```
+
+Supply only the binaries to compare; credentials, logs, binary hashes and results
+stay in the external artifact directory. No production configuration is touched.
 
 Extend existing ClawUp `bot_runtimes.json` and Fleet app specs. Backend-specific
 transport configuration may be generated as private runtime state, not maintained
