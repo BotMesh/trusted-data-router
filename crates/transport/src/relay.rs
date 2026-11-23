@@ -38,6 +38,17 @@ use tokio_util::{
     sync::CancellationToken,
 };
 
+mod chisel;
+mod chisel_access;
+
+trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Io for T {}
+type Stream = Box<dyn Io>;
+enum Backend {
+    Yamux(mpsc::Sender<Open>),
+    Chisel(Box<chisel::Connection>),
+}
+
 type HttpResult = std::result::Result<Response, StatusCode>;
 type Open = oneshot::Sender<yamux::Stream>;
 
@@ -46,7 +57,7 @@ pub(crate) struct Session {
     expires_at: AtomicU64,
     renewed: Notify,
     serial: u64,
-    open: mpsc::Sender<Open>,
+    backend: Backend,
     pub(crate) cancel: CancellationToken,
     slots: Arc<Semaphore>,
 }
@@ -115,6 +126,8 @@ pub struct Relay {
     storage_slot: Arc<Semaphore>,
     serial: AtomicU64,
     watchdog_started: AtomicBool,
+    chisel: std::sync::OnceLock<Arc<crate::chisel::Broker>>,
+    chisel_access: Mutex<HashMap<String, Arc<chisel_access::ClientSession>>>,
 }
 
 impl Relay {
@@ -146,7 +159,15 @@ impl Relay {
             storage_slot: Arc::new(Semaphore::new(1)),
             serial: AtomicU64::new(1),
             watchdog_started: AtomicBool::new(false),
+            chisel: std::sync::OnceLock::new(),
+            chisel_access: Mutex::new(HashMap::new()),
         }))
+    }
+    /// Install the upstream backend before serving requests.
+    pub fn enable_chisel(&self, broker: Arc<crate::chisel::Broker>) -> crate::Result<()> {
+        self.chisel
+            .set(broker)
+            .map_err(|_| crate::Error::InvalidContract)
     }
     /// Serialize durable transitions off the async workers. The closure owns
     /// the permit through commit and publication even if its caller disconnects.
@@ -178,7 +199,18 @@ impl Relay {
             .route("/healthz", get(|| async { StatusCode::OK }))
             .route("/v1/connect/{route}", get(connect))
             .route("/v1/connect/{route}/renew", post(renew))
+            .route("/v1/connect/{route}/chisel", post(chisel::enroll))
+            .route("/v1/connect/{route}/chisel/{lease}", get(chisel::attach))
+            .route(
+                "/v1/connect/{route}/chisel/{lease}/ready",
+                post(chisel::confirm),
+            )
             .route("/v1/tunnel/{route}", get(tunnel))
+            .route("/v1/tunnel/{route}/chisel", post(chisel_access::enroll))
+            .route(
+                "/v1/tunnel/{route}/chisel/{lease}",
+                get(chisel_access::attach),
+            )
             .route("/v1/ready/{route}", get(ready))
             .route("/v1/http/{route}/", any(http_proxy))
             .route("/v1/http/{route}/{*rest}", any(http_proxy))
@@ -492,7 +524,7 @@ async fn connect(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResul
         renewed: Notify::new(),
         grant,
         serial: relay.serial.fetch_add(1, Ordering::Relaxed),
-        open: tx,
+        backend: Backend::Yamux(tx),
         cancel: cancel.clone(),
         slots: Arc::new(Semaphore::new(256)),
     });
@@ -567,21 +599,31 @@ async fn renew(State(relay): State<Arc<Relay>>, req: Request) -> HttpResult {
         .unwrap())
 }
 
-async fn open(session: &Session) -> std::result::Result<yamux::Stream, StatusCode> {
-    let (tx, rx) = oneshot::channel();
-    session
-        .open
-        .try_send(tx)
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+async fn open(session: &Session) -> std::result::Result<Stream, StatusCode> {
     tokio::time::timeout(Duration::from_secs(15), async {
-        let mut stream = rx.await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        // Yamux opens outbound streams lazily. Queue its empty SYN frame so
-        // server-first protocols reach the target without client payload. Do
-        // not use write_all: an empty slice would skip poll_write entirely.
-        futures::AsyncWriteExt::write(&mut stream, &[])
-            .await
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        Ok(stream)
+        match &session.backend {
+            Backend::Yamux(sender) => {
+                let (tx, rx) = oneshot::channel();
+                sender
+                    .try_send(tx)
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                let mut stream = rx.await.map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                // Yamux opens lazily; queue its standard empty SYN for server-first protocols.
+                futures::AsyncWriteExt::write(&mut stream, &[])
+                    .await
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                Ok(Box::new(stream.compat()) as Stream)
+            }
+            Backend::Chisel(connection) => {
+                if !connection.ready.load(Ordering::Acquire) {
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
+                let stream = tokio::net::TcpStream::connect(connection.reverse_address)
+                    .await
+                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                Ok(Box::new(stream) as Stream)
+            }
+        }
     })
     .await
     .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
@@ -597,7 +639,10 @@ async fn ready(State(relay): State<Arc<Relay>>, req: Request) -> HttpResult {
         .authenticate(&req, Purpose::Access)
         .or_else(|_| relay.authenticate(&req, Purpose::Probe))?;
     let session = relay.session(&grant)?;
-    if session.open.is_closed() {
+    if match &session.backend {
+        Backend::Yamux(sender) => sender.is_closed(),
+        Backend::Chisel(connection) => !connection.ready.load(Ordering::Acquire),
+    } {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
     Response::builder()
@@ -619,7 +664,7 @@ async fn tunnel(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResult
         .try_acquire_owned()
         .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
     let (response, upgraded) = upgrade(&mut req)?;
-    let mut upstream = open(&session).await?.compat();
+    let mut upstream = open(&session).await?;
     tokio::spawn(async move {
         let _slot = slot;
         let copy = async {
@@ -734,10 +779,9 @@ async fn http_proxy(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpRe
     req.headers_mut().insert("x-trusted-route", capability);
     req.headers_mut()
         .insert("host", "localhost".parse().unwrap());
-    let (mut sender, connection) =
-        hyper::client::conn::http1::handshake(TokioIo::new(stream.compat()))
-            .await
-            .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+        .await
+        .map_err(|_| StatusCode::BAD_GATEWAY)?;
     let cancellation = access.cancel.clone();
     let connection_access = access.clone();
     let connection_slot = slot.clone();

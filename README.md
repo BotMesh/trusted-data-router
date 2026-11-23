@@ -159,9 +159,8 @@ protocols, including HTTP/2; it does not open arbitrary destinations on the node
 The forwarder reuses axum's accept retry/backoff so transient socket errors or
 file-descriptor exhaustion do not tear down established streams. New connections
 resume when resources become available; explicit shutdown still drains all streams.
-TCP half-close remains unsupported: a write EOF closes the WebSocket tunnel, so
-protocols that wait for EOF before replying can lose their response. This must be
-resolved before migrating such protocols. Durable transitions run serially on a
+The legacy raw WebSocket tunnel lacks TCP half-close. The Chisel node/client
+path preserves it; do not migrate EOF-dependent protocols over the legacy path. Durable transitions run serially on a
 blocking worker without holding the in-memory routing lock during SQLite I/O.
 Unchanged control snapshots and same-execution reconnects skip writes. Changes
 are published only after commit, even if the requesting client disconnects;
@@ -181,10 +180,16 @@ attestation; those proofs and OpenShell enforcement belong in rail/shim.
 
 ## Reuse and integration
 
-The default transport still composes Rust protocol libraries. A private process
-adapter for upstream Chisel is implemented and tested below; it is not yet wired
-to the public relay endpoints or shim. Fleet admission, exact-instance routing
-and per-connection revocation remain the Router's responsibility.
+The Chisel node/client path is wired to public enrollment, authorization, renewal
+and revocation endpoints. Compose enables the bundled helper; standalone CLI
+commands select it with `TRUSTED_ROUTER_TUNNEL_BINARY=/absolute/helper`. Legacy
+endpoints remain for existing deployments until migration acceptance and removal.
+Fleet admission and exact-instance authorization remain the Router's responsibility.
+
+**Handover/WIP:** strict WebSocket attach acceptance currently fails on missing
+subprotocol negotiation ([#11](https://github.com/attestx/trusted-data-router/issues/11)).
+Deployment packaging, application migration and removal of legacy transport are
+unfinished. This branch is not approval for a production migration.
 
 [`tools/test_upstream_tunnels.py`](tools/test_upstream_tunnels.py) compares unmodified
 upstream binaries with two loopback services, verified WSS certificates, 512 KiB
@@ -219,13 +224,17 @@ permanent deny-only user prevents upstream's empty user table from disabling
 authentication. Control-channel failure kills the server; client drop kills its
 process. Deleting a user alone still does **not** close an established tunnel.
 
-Tests cover verified WSS, binary data, server-first traffic, TCP half-close,
-unauthorized reverse listeners and forward SSH channels, empty-table rejection,
-and closing one connector while another stays usable. These are adapter tests,
-**not Fleet tenant-authorization or NAT acceptance**. Pending integration must
-bind each public upgrade to its exact lease, keep reverse ports private, and
-close active streams on route/access revocation and expiry. Then rerun isolated
-NAT/reconnect, HTTP/SSE/WebSocket and real SSH/rsync acceptance before cutover.
+Each enrollment uses an isolated native SSH server inside one helper process,
+preventing credentials for another lease from authenticating through its HTTP
+upgrade. Rust owns only the authorization boundary and ordinary local TCP copies;
+upstream Chisel owns SSH multiplexing, WSS transport and keepalive.
+
+Local evidence includes Go race tests, wrong-domain credential rejection, binary
+traffic, half-close, registration renewal and Fleet revocation. Isolated Linux
+NAT tests passed with two overlapping private networks, outbound TCP/443 only,
+40-second idle continuity, blackhole cleanup and recovery without replay. The
+new strict attach test above remains failing; full cross-machine application
+acceptance and deployment validation remain open.
 
 Build outside the source tree and run the process acceptance:
 
@@ -233,6 +242,8 @@ Build outside the source tree and run the process acceptance:
 (cd tunnel/chisel && go test -race ./... && CGO_ENABLED=0 go build -trimpath -o /tmp/trusted-router-tunnel .)
 TRUSTED_ROUTER_TUNNEL_BINARY=/tmp/trusted-router-tunnel \
   cargo test --locked -p trusted-router-transport --test chisel_process -- --ignored
+TRUSTED_ROUTER_TUNNEL_BINARY=/tmp/trusted-router-tunnel \
+  cargo test --locked -p trusted-router-transport --test data_plane upstream_chisel -- --ignored
 ```
 
 The standalone comparison with stock release binaries remains available:

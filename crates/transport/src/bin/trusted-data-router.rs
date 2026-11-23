@@ -46,6 +46,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .map(|s| s.trim().to_owned())
                 .collect();
             let relay = Relay::new(verifier, database)?;
+            if let Some(binary) = env::var_os("TRUSTED_ROUTER_TUNNEL_BINARY") {
+                relay.enable_chisel(
+                    trusted_router_transport::chisel::Broker::start(Path::new(&binary)).await?,
+                )?;
+            }
             let client = ControlClient::from_env()?;
             if client.is_none() && relay.requires_control()? {
                 return Err("persisted managed relay requires Fleet control configuration".into());
@@ -81,20 +86,40 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 shutdown.cancel();
             });
             if args[0] == "forward" {
-                edge::forward(
-                    TcpListener::bind(&args[2]).await?,
-                    args[1].clone(),
-                    String::from_utf8(file(&args[3])?)?.trim().into(),
-                    stop,
-                )
-                .await?;
+                let listener = TcpListener::bind(&args[2]).await?;
+                let token = String::from_utf8(file(&args[3])?)?.trim().to_owned();
+                if let Some(binary) = env::var_os("TRUSTED_ROUTER_TUNNEL_BINARY") {
+                    edge::forward_chisel(
+                        Path::new(&binary),
+                        listener,
+                        args[1].clone(),
+                        token,
+                        stop,
+                    )
+                    .await?;
+                } else {
+                    edge::forward(listener, args[1].clone(), token, stop).await?;
+                }
             } else {
                 let mut backoff = 1;
                 loop {
                     let token = String::from_utf8(file(&args[3])?)?;
                     let start = std::time::Instant::now();
-                    let attempt =
-                        edge::connect(&args[1], token.trim(), args[2].parse()?, stop.clone());
+                    let target = args[2].parse()?;
+                    let attempt = async {
+                        if let Some(binary) = env::var_os("TRUSTED_ROUTER_TUNNEL_BINARY") {
+                            edge::connect_chisel(
+                                Path::new(&binary),
+                                &args[1],
+                                token.trim(),
+                                target,
+                                stop.clone(),
+                            )
+                            .await
+                        } else {
+                            edge::connect(&args[1], token.trim(), target, stop.clone()).await
+                        }
+                    };
                     tokio::select! { _ = stop.cancelled() => break, _ = attempt => {} }
                     if start.elapsed() > Duration::from_secs(30) {
                         backoff = 1;

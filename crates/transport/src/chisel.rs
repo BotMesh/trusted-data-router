@@ -23,6 +23,7 @@ struct Process {
 struct Reply {
     ok: bool,
     fingerprint: Option<String>,
+    address: Option<SocketAddr>,
 }
 
 impl Process {
@@ -83,31 +84,24 @@ impl Process {
 
 struct Request {
     body: Value,
-    reply: Option<oneshot::Sender<Result<()>>>,
+    reply: Option<oneshot::Sender<Result<Reply>>>,
 }
 
-/// One shared Chisel server. Its listener must stay private to the Router host.
-pub struct Server {
-    pub address: SocketAddr,
-    pub fingerprint: String,
+/// One helper process hosting isolated upstream SSH domains for each lease.
+pub struct Broker {
     requests: mpsc::Sender<Request>,
     stopped: CancellationToken,
 }
 
-impl Server {
-    pub async fn start(binary: &Path, address: SocketAddr) -> Result<Arc<Self>> {
-        loopback(address)?;
+impl Broker {
+    pub async fn start(binary: &Path) -> Result<Arc<Self>> {
         let (mut process, reply) = Process::start(
             binary,
             json!({
-                "mode": "server", "listen": address.to_string(),
+                "mode": "broker",
             }),
         )
         .await?;
-        let fingerprint = reply
-            .fingerprint
-            .filter(|s| s.len() == 44)
-            .ok_or(Error::Unavailable)?;
         if !reply.ok {
             return Err(Error::Unavailable);
         }
@@ -131,7 +125,7 @@ impl Server {
                 if let Some(reply) = request.reply {
                     let result = response.and_then(|r| {
                         if r.ok {
-                            Ok(())
+                            Ok(r)
                         } else {
                             Err(Error::InvalidContract)
                         }
@@ -147,12 +141,7 @@ impl Server {
             stop.cancel();
             let _ = process.child.kill().await;
         });
-        Ok(Arc::new(Self {
-            address,
-            fingerprint,
-            requests,
-            stopped,
-        }))
+        Ok(Arc::new(Self { requests, stopped }))
     }
 
     pub fn stopped(&self) -> CancellationToken {
@@ -168,28 +157,43 @@ impl Server {
         getrandom::getrandom(&mut random).map_err(|_| Error::Unavailable)?;
         let user = hex::encode(&random[..32]);
         let password = hex::encode(&random[32..]);
-        let lease = Lease {
+        let mut lease = Lease {
             server: self.clone(),
             user: user.clone(),
             auth: format!("{user}:{password}"),
+            address: "127.0.0.1:0".parse().unwrap(),
+            fingerprint: String::new(),
         };
         let (reply, result) = oneshot::channel();
         self.requests.send(Request {
             body: json!({"op": "add", "user": user, "password": password, "address": address.to_string(), "reverse": reverse}),
             reply: Some(reply),
         }).await.map_err(|_| Error::Unavailable)?;
-        result.await.map_err(|_| Error::Unavailable)??;
+        let reply = result.await.map_err(|_| Error::Unavailable)??;
+        lease.address = loopback(reply.address.ok_or(Error::Unavailable)?)?;
+        lease.fingerprint = reply
+            .fingerprint
+            .filter(|s| s.len() == 44)
+            .ok_or(Error::Unavailable)?;
+        if lease.address.port() == 0 {
+            return Err(Error::Unavailable);
+        }
         Ok(lease)
     }
 }
 
 /// Deliberately has no Debug implementation: SSH credentials are secrets.
 pub struct Lease {
-    server: Arc<Server>,
+    server: Arc<Broker>,
     user: String,
     auth: String,
+    pub address: SocketAddr,
+    pub fingerprint: String,
 }
 impl Lease {
+    pub fn id(&self) -> &str {
+        &self.user
+    }
     pub fn auth(&self) -> &str {
         &self.auth
     }

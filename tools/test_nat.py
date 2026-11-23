@@ -234,7 +234,7 @@ async def probe(host, port, expect_open=False):
         raise AssertionError('firewall unexpectedly allowed a new connection')
 
 
-def acceptance(binary, python, root):
+def acceptance(binary, python, root, tunnel_binary=None):
     namespaces, processes, logs = [], [], []
     prefix = 'router-nat-' + secrets.token_hex(4)
     central = prefix + '-central'
@@ -248,7 +248,9 @@ def acceptance(binary, python, root):
     def command(namespace, *args):
         return ['sudo', '-n', 'ip', 'netns', 'exec', namespace, 'setpriv',
                 '--reuid=' + str(os.getuid()), '--regid=' + str(os.getgid()), '--clear-groups',
-                'env', 'SSL_CERT_FILE=' + str(root / 'ca.pem'), *map(str, args)]
+                'env', 'SSL_CERT_FILE=' + str(root / 'ca.pem'),
+                *(['TRUSTED_ROUTER_TUNNEL_BINARY=' + str(tunnel_binary)] if tunnel_binary else []),
+                *map(str, args)]
 
     def spawn(namespace, name, *args):
         log = (root / (name + '.log')).open('wb')
@@ -348,6 +350,7 @@ def acceptance(binary, python, root):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--router-binary', type=Path)
+    parser.add_argument('--tunnel-binary', type=Path, help='Use the pinned upstream Chisel adapter')
     parser.add_argument('--python', type=Path, default=Path(sys.executable))
     parser.add_argument('--artifacts', type=Path)
     parser.add_argument('--component', choices=['app', 'proxy', 'check', 'probe'])
@@ -370,10 +373,10 @@ def main():
     run('sudo', '-n', 'true')
     if args.artifacts:
         args.artifacts.mkdir(mode=0o700, parents=True, exist_ok=False)
-        acceptance(args.router_binary.resolve(), args.python.absolute(), args.artifacts.resolve())
+        acceptance(args.router_binary.resolve(), args.python.absolute(), args.artifacts.resolve(), args.tunnel_binary.resolve() if args.tunnel_binary else None)
     else:
         with tempfile.TemporaryDirectory(prefix='router-nat-') as directory:
-            acceptance(args.router_binary.resolve(), args.python.absolute(), Path(directory))
+            acceptance(args.router_binary.resolve(), args.python.absolute(), Path(directory), args.tunnel_binary.resolve() if args.tunnel_binary else None)
 
 
 if __name__ == '__main__':

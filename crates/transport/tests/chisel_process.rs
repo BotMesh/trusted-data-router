@@ -4,7 +4,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
-use trusted_router_transport::chisel::{Client, ClientConfig, Server};
+use trusted_router_transport::chisel::{Broker, Client, ClientConfig};
 
 async fn unused() -> SocketAddr {
     TcpListener::bind("127.0.0.1:0")
@@ -70,23 +70,38 @@ async fn acceptance() {
     let binary = PathBuf::from(
         std::env::var_os("TRUSTED_ROUTER_TUNNEL_BINARY").expect("build the pinned helper first"),
     );
-    let address = unused().await;
-    let server = Server::start(&binary, address).await.unwrap();
+    let server = Broker::start(&binary).await.unwrap();
     let stopped = server.stopped();
-    let endpoint = format!("http://{address}");
     let (app_a, task_a) = application(b'A').await;
     let (app_b, task_b) = application(b'B').await;
     let (route_a, route_b) = (unused().await, unused().await);
     let lease_a = server.authorize(route_a, true).await.unwrap();
     let lease_b = server.authorize(route_b, true).await.unwrap();
+    // Even knowing A's public fingerprint cannot authenticate B's credential
+    // through A's isolated native SSH server.
+    assert!(Client::start(
+        &binary,
+        ClientConfig {
+            server: &format!("http://{}", lease_a.address),
+            token: "fixture",
+            auth: lease_b.auth(),
+            fingerprint: &lease_a.fingerprint,
+            listen: route_b,
+            target: app_b,
+            reverse: true,
+            ca: None,
+        }
+    )
+    .await
+    .is_err());
     // A second tenant cannot reuse the first lease to bind another address.
     assert!(Client::start(
         &binary,
         ClientConfig {
-            server: &endpoint,
+            server: &format!("http://{}", lease_a.address),
             token: "fixture",
             auth: lease_a.auth(),
-            fingerprint: &server.fingerprint,
+            fingerprint: &lease_a.fingerprint,
             listen: route_b,
             target: app_a,
             reverse: true,
@@ -98,7 +113,7 @@ async fn acceptance() {
     assert!(Client::start(
         &binary,
         ClientConfig {
-            server: &endpoint,
+            server: &format!("http://{}", lease_a.address),
             token: "fixture",
             auth: lease_a.auth(),
             fingerprint: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
@@ -113,10 +128,10 @@ async fn acceptance() {
     let client_a = Client::start(
         &binary,
         ClientConfig {
-            server: &endpoint,
+            server: &format!("http://{}", lease_a.address),
             token: "fixture",
             auth: lease_a.auth(),
-            fingerprint: &server.fingerprint,
+            fingerprint: &lease_a.fingerprint,
             listen: route_a,
             target: app_a,
             reverse: true,
@@ -128,10 +143,10 @@ async fn acceptance() {
     let client_b = Client::start(
         &binary,
         ClientConfig {
-            server: &endpoint,
+            server: &format!("http://{}", lease_b.address),
             token: "fixture",
             auth: lease_b.auth(),
-            fingerprint: &server.fingerprint,
+            fingerprint: &lease_b.fingerprint,
             listen: route_b,
             target: app_b,
             reverse: true,
@@ -146,10 +161,10 @@ async fn acceptance() {
     let forward = Client::start(
         &binary,
         ClientConfig {
-            server: &endpoint,
+            server: &format!("http://{}", access.address),
             token: "fixture",
             auth: access.auth(),
-            fingerprint: &server.fingerprint,
+            fingerprint: &access.fingerprint,
             listen: local,
             target: route_a,
             reverse: false,

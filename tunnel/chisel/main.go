@@ -96,7 +96,7 @@ func clientConfig(c config) (*chclient.Config, error) {
 	return &chclient.Config{
 		Server: c.Server, Auth: c.Auth, Fingerprint: c.Fingerprint,
 		Headers: http.Header{"Authorization": {"Bearer " + c.Token}},
-		Remotes: []string{remote}, KeepAlive: 25 * time.Second,
+		Remotes: []string{remote}, KeepAlive: 10 * time.Second,
 		// Rust must obtain a fresh lease before reconnecting. Never retry a
 		// spent lease or replay application requests inside this process.
 		MaxRetryCount: 0, TLS: chclient.TLSConfig{CA: c.CA},
@@ -107,7 +107,7 @@ func newServer(listen string) (*chserver.Server, error) {
 	if !loopback(listen) {
 		return nil, errors.New("invalid server listener")
 	}
-	s, err := chserver.NewServer(&chserver.Config{Reverse: true, KeepAlive: 25 * time.Second})
+	s, err := chserver.NewServer(&chserver.Config{Reverse: true, KeepAlive: 10 * time.Second})
 	if err != nil {
 		return nil, err
 	}
@@ -166,23 +166,55 @@ func run(ctx context.Context, input io.Reader, output io.Writer) error {
 	}
 	out := json.NewEncoder(output)
 	switch c.Mode {
-	case "server":
-		if c.Server != "" || c.Token != "" || c.Auth != "" || c.Fingerprint != "" || c.Target != "" || c.Reverse || c.CA != "" {
-			return errors.New("invalid server configuration")
+	case "broker":
+		if c != (config{Mode: "broker"}) {
+			return errors.New("invalid broker configuration")
 		}
-		s, err := newServer(c.Listen)
-		if err != nil {
+		servers := make(map[string]*chserver.Server)
+		defer func() {
+			for _, server := range servers {
+				server.Close()
+			}
+		}()
+		if err := out.Encode(map[string]bool{"ok": true}); err != nil {
 			return err
 		}
-		defer s.Close()
-		if err := out.Encode(map[string]any{"ok": true, "fingerprint": s.GetFingerprint()}); err != nil {
-			return err
-		}
-		users := make(map[string]bool)
 		for lines.Scan() {
 			var cmd command
-			ok := decode(lines.Bytes(), &cmd) == nil && apply(s, users, cmd) == nil
-			if err := out.Encode(map[string]bool{"ok": ok}); err != nil {
+			reply := map[string]any{"ok": false}
+			if decode(lines.Bytes(), &cmd) == nil && credential(cmd.User) {
+				switch cmd.Op {
+				case "add":
+					if len(servers) < 8192 && servers[cmd.User] == nil && credential(cmd.Password) && loopback(cmd.Address) {
+						// Each lease has its own native SSH authentication domain.
+						// A credential for B cannot authenticate through A's HTTP upgrade.
+						reservation, err := net.Listen("tcp", "127.0.0.1:0")
+						if err == nil {
+							address := reservation.Addr().String()
+							reservation.Close()
+							server, err := newServer(address)
+							if err == nil {
+								if apply(server, make(map[string]bool), cmd) == nil {
+									servers[cmd.User] = server
+									reply = map[string]any{"ok": true, "address": address, "fingerprint": server.GetFingerprint()}
+								} else {
+									server.Close()
+								}
+							}
+						}
+					}
+				case "remove":
+					if cmd.Password == "" && cmd.Address == "" && !cmd.Reverse {
+						if server := servers[cmd.User]; server != nil {
+							server.DeleteUser(cmd.User)
+							server.Close()
+							delete(servers, cmd.User)
+						}
+						reply["ok"] = true
+					}
+				}
+			}
+			if err := out.Encode(reply); err != nil {
 				return err
 			}
 		}

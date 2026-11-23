@@ -92,13 +92,17 @@ async fn application() -> (
 
 #[tokio::test]
 async fn outbound_http_sse_websocket_auth_expiry_revocation_and_recovery() {
-    tokio::time::timeout(Duration::from_secs(50), acceptance())
+    tokio::time::timeout(Duration::from_secs(50), acceptance(false))
         .await
         .unwrap();
 }
 
 #[tokio::test]
 async fn registration_renewal_preserves_streams_without_extending_access_or_reviving_routes() {
+    renewal(false).await;
+}
+
+async fn renewal(chisel: bool) {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let temp = tempfile::tempdir().unwrap();
     let private = temp.path().join("key");
@@ -123,6 +127,7 @@ async fn registration_renewal_preserves_streams_without_extending_access_or_revi
         &temp.path().join("routes.db"),
     )
     .unwrap();
+    upstream(&relay, chisel).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let relay_task = tokio::spawn(relay.serve(listener));
@@ -162,7 +167,8 @@ async fn registration_renewal_preserves_streams_without_extending_access_or_revi
     let worker_stop = stop.clone();
     let token = grants::sign(&key, &register).unwrap();
     let worker = tokio::spawn(async move {
-        edge::connect(
+        connect(
+            chisel,
             &format!("ws://{address}/v1/connect/{route}"),
             &token,
             app,
@@ -313,12 +319,12 @@ async fn registration_renewal_preserves_streams_without_extending_access_or_revi
 
 #[tokio::test]
 async fn fleet_sync_revokes_live_streams_and_fails_closed_on_restart_and_outage() {
-    tokio::time::timeout(Duration::from_secs(15), managed_acceptance())
+    tokio::time::timeout(Duration::from_secs(15), managed_acceptance(false))
         .await
         .unwrap();
 }
 
-async fn managed_acceptance() {
+async fn managed_acceptance(chisel: bool) {
     use serde_json::{json, Value};
     use std::{
         os::unix::fs::PermissionsExt,
@@ -400,6 +406,7 @@ async fn managed_acceptance() {
     let verifier = Verifier::new(&public, "test-gateway".into()).unwrap();
     let database = temp.path().join("relay.db");
     let relay = Relay::new(verifier.clone(), &database).unwrap();
+    upstream(&relay, chisel).await;
     relay.bind_control(&client).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -471,7 +478,7 @@ async fn managed_acceptance() {
         let url = format!("ws://{addr}/v1/connect/{}", g.route_id());
         let token = signed(g, Purpose::Register);
         let stop = stop.clone();
-        tokio::spawn(async move { edge::connect(&url, &token, app, stop).await })
+        tokio::spawn(async move { connect(chisel, &url, &token, app, stop).await })
     };
     let connector = start(&grant);
     for _ in 0..100 {
@@ -508,6 +515,7 @@ async fn managed_acceptance() {
     // Reopening SQLite starts unavailable, preserves all tombstones and refuses
     // authority changes, even if deployment accidentally omits control config.
     let recovered = Relay::new(verifier, &database).unwrap();
+    upstream(&recovered, chisel).await;
     assert!(recovered.requires_control().unwrap());
     recovered.bind_control(&client).unwrap();
     let other = ControlClient::new(&control_url, "relay-b".into(), token_file).unwrap();
@@ -528,7 +536,8 @@ async fn managed_acceptance() {
     assert!(
         tokio::time::timeout(
             Duration::from_secs(1),
-            edge::connect(
+            connect(
+                chisel,
                 &format!("ws://{recovery_addr}/v1/connect/{}", grant.route_id()),
                 &signed(&grant, Purpose::Register),
                 app,
@@ -710,7 +719,12 @@ async fn managed_acceptance() {
     app_task.abort();
 }
 
-async fn server_first_tcp(address: std::net::SocketAddr, key: &[u8], template: &Grant) {
+async fn server_first_tcp(
+    chisel: bool,
+    address: std::net::SocketAddr,
+    key: &[u8],
+    template: &Grant,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut grant = template.clone();
     grant.service.service = "banner".into();
@@ -726,12 +740,19 @@ async fn server_first_tcp(address: std::net::SocketAddr, key: &[u8], template: &
         tcp.read_exact(&mut bytes).await.unwrap();
         assert_eq!(&bytes, b"ping"); // tunnel setup must inject no application bytes
         tcp.write_all(&bytes).await.unwrap();
+        if chisel {
+            let mut remainder = Vec::new();
+            tcp.read_to_end(&mut remainder).await.unwrap();
+            assert!(remainder.is_empty());
+            tcp.write_all(b"EOF-response").await.unwrap();
+        }
     });
     let stop = CancellationToken::new();
     let connector = tokio::spawn({
         let stop = stop.clone();
         async move {
-            edge::connect(
+            connect(
+                chisel,
                 &format!("ws://{address}/v1/connect/{route}"),
                 &token,
                 target,
@@ -761,32 +782,93 @@ async fn server_first_tcp(address: std::net::SocketAddr, key: &[u8], template: &
     })
     .await
     .unwrap();
+    if chisel {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let offer: serde_json::Value = http
+            .post(format!(
+                "http://{address}/v1/tunnel/{}/chisel",
+                grant.route_id()
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let url = format!(
+            "ws://{address}/v1/tunnel/{}/chisel/{}",
+            grant.route_id(),
+            offer["lease"].as_str().unwrap()
+        );
+        let request = |token: &str| {
+            let mut req = url.clone().into_client_request().unwrap();
+            req.headers_mut()
+                .insert("authorization", format!("Bearer {token}").parse().unwrap());
+            req.headers_mut()
+                .insert("sec-websocket-protocol", "chisel-v3".parse().unwrap());
+            req
+        };
+        let mut other = grant.clone();
+        other.sub = "another-owner".into();
+        let error = tokio_tungstenite::connect_async(request(&grants::sign(key, &other).unwrap()))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, tokio_tungstenite::tungstenite::Error::Http(r) if r.status()==403));
+        let (socket, _) = tokio_tungstenite::connect_async(request(&token))
+            .await
+            .unwrap();
+        let error = tokio_tungstenite::connect_async(request(&token))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, tokio_tungstenite::tungstenite::Error::Http(r) if r.status()==409));
+        drop(socket);
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local = listener.local_addr().unwrap();
-    let forward = tokio::spawn(edge::forward(
+    let forward = tokio::spawn(forward(
+        chisel,
         listener,
         format!("ws://{address}/v1/tunnel/{}", grant.route_id()),
         token,
         stop.clone(),
     ));
-    let mut tcp = tokio::net::TcpStream::connect(local).await.unwrap();
-    let mut banner = [0; 17];
-    tokio::time::timeout(Duration::from_secs(3), tcp.read_exact(&mut banner))
-        .await
-        .expect("server-first protocols must not wait for client bytes")
-        .unwrap();
-    assert_eq!(&banner, b"SSH-2.0-fixture\r\n");
+    let mut tcp = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(mut tcp) = tokio::net::TcpStream::connect(local).await {
+                let mut banner = [0; 17];
+                if tcp.read_exact(&mut banner).await.is_ok() {
+                    assert_eq!(&banner, b"SSH-2.0-fixture\r\n");
+                    break tcp;
+                }
+            }
+            // The stock client takes ownership of the loopback listener during
+            // enrollment. Retry only before sending any application bytes.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("server-first data must arrive without client payload");
     tcp.write_all(b"ping").await.unwrap();
     let mut response = [0; 4];
     tcp.read_exact(&mut response).await.unwrap();
     assert_eq!(&response, b"ping");
+    if chisel {
+        tcp.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), tcp.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, b"EOF-response");
+    }
     app.await.unwrap();
     stop.cancel();
     forward.await.unwrap().unwrap();
     connector.await.unwrap().unwrap();
 }
 
-async fn acceptance() {
+async fn acceptance(chisel: bool) {
     let temp = tempfile::tempdir().unwrap();
     let key_path = temp.path().join("private.pem");
     let pub_path = temp.path().join("public.pem");
@@ -871,10 +953,11 @@ async fn acceptance() {
     assert!(grants::sign(&key, &bound).is_err());
     let db = temp.path().join("routes.db");
     let relay = Relay::new(verifier.clone(), &db).unwrap();
+    upstream(&relay, chisel).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let relay_task = tokio::spawn(relay.serve(listener));
-    server_first_tcp(address, &key, &grant).await;
+    server_first_tcp(chisel, address, &key, &grant).await;
     let (app, app_task, accepts) = application().await;
     let http = reqwest::Client::new();
     let ready_url = format!("http://{address}/v1/ready/{route}");
@@ -894,7 +977,7 @@ async fn acceptance() {
         let url = connector_url.clone();
         let token = register.clone();
         let stop = stop.clone();
-        async move { edge::connect(&url, &token, app, stop).await }
+        async move { connect(chisel, &url, &token, app, stop).await }
     });
     let http = reqwest::Client::new();
     let base = format!("http://{address}/v1/http/{route}");
@@ -1038,11 +1121,15 @@ async fn acceptance() {
             .status(),
         403
     );
-    assert!(
-        edge::connect(&connector_url, &register, app, CancellationToken::new())
-            .await
-            .is_err()
-    );
+    assert!(connect(
+        chisel,
+        &connector_url,
+        &register,
+        app,
+        CancellationToken::new()
+    )
+    .await
+    .is_err());
     // Real SSE: observe multiple chunks before the response ever completes.
     let mut events = http
         .get(format!("{base}/events"))
@@ -1067,7 +1154,8 @@ async fn acceptance() {
     let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_address = local.local_addr().unwrap();
     let forward_stop = CancellationToken::new();
-    let forward = tokio::spawn(edge::forward(
+    let forward = tokio::spawn(forward(
+        chisel,
         local,
         format!("ws://{address}/v1/tunnel/{route}"),
         access.clone(),
@@ -1178,9 +1266,26 @@ async fn acceptance() {
         let url = connector_url.clone();
         let token = register.clone();
         let stop = stop2.clone();
-        async move { edge::connect(&url, &token, app, stop).await }
+        async move { connect(chisel, &url, &token, app, stop).await }
     });
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if http
+                .get(&ready_url)
+                .bearer_auth(&bound_access)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                == 204
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(
         http.get(format!("{base}/echo"))
             .header("x-trusted-access", &access)
@@ -1216,22 +1321,31 @@ async fn acceptance() {
     .await
     .unwrap();
     connector2.await.unwrap().unwrap();
-    assert!(
-        edge::connect(&connector_url, &register, app, CancellationToken::new())
-            .await
-            .is_err()
-    );
+    assert!(connect(
+        chisel,
+        &connector_url,
+        &register,
+        app,
+        CancellationToken::new()
+    )
+    .await
+    .is_err());
     // Revocation survives relay replacement and does not depend on in-memory sockets.
     relay_task.abort();
     let _ = relay_task.await;
     let restarted = Relay::new(verifier, &db).unwrap();
+    upstream(&restarted, chisel).await;
     let listener = TcpListener::bind(address).await.unwrap();
     let restarted_task = tokio::spawn(restarted.serve(listener));
-    assert!(
-        edge::connect(&connector_url, &register, app, CancellationToken::new())
-            .await
-            .is_err()
-    );
+    assert!(connect(
+        chisel,
+        &connector_url,
+        &register,
+        app,
+        CancellationToken::new()
+    )
+    .await
+    .is_err());
     // Replacement can use a new generation, but the retired lease stays fenced.
     let mut replacement = grant.clone();
     replacement.execution.generation = 2;
@@ -1243,12 +1357,13 @@ async fn acceptance() {
         let url = replacement_url.clone();
         let token = replacement_register.clone();
         let stop = replacement_stop.clone();
-        async move { edge::connect(&url, &token, app, stop).await }
+        async move { connect(chisel, &url, &token, app, stop).await }
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
     let mut conflicting = replacement.clone();
     conflicting.execution.lease_id = "another-lease-at-generation-2".into();
-    assert!(edge::connect(
+    assert!(connect(
+        chisel,
         &format!("ws://{address}/v1/connect/{}", conflicting.route_id()),
         &grants::sign(&key, &conflicting).unwrap(),
         app,
@@ -1261,7 +1376,8 @@ async fn acceptance() {
     let mut stale = replacement.clone();
     stale.execution.generation = 1;
     stale.execution.lease_id = "different-old-lease".into();
-    assert!(edge::connect(
+    assert!(connect(
+        chisel,
         &format!("ws://{address}/v1/connect/{}", stale.route_id()),
         &grants::sign(&key, &stale).unwrap(),
         app,
@@ -1273,4 +1389,69 @@ async fn acceptance() {
     forward.await.unwrap().unwrap();
     restarted_task.abort();
     app_task.abort();
+}
+
+async fn upstream(relay: &Arc<Relay>, enabled: bool) {
+    if enabled {
+        let binary = std::env::var_os("TRUSTED_ROUTER_TUNNEL_BINARY").expect("build pinned helper");
+        relay
+            .enable_chisel(
+                trusted_router_transport::chisel::Broker::start(std::path::Path::new(&binary))
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+}
+
+async fn connect(
+    chisel: bool,
+    url: &str,
+    token: &str,
+    target: std::net::SocketAddr,
+    stop: CancellationToken,
+) -> trusted_router_transport::Result<()> {
+    if chisel {
+        let binary = std::env::var_os("TRUSTED_ROUTER_TUNNEL_BINARY").expect("build pinned helper");
+        edge::connect_chisel(std::path::Path::new(&binary), url, token, target, stop).await
+    } else {
+        edge::connect(url, token, target, stop).await
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires pinned Chisel helper"]
+async fn upstream_chisel_data_plane() {
+    tokio::time::timeout(Duration::from_secs(60), acceptance(true))
+        .await
+        .unwrap();
+}
+#[tokio::test]
+#[ignore = "requires pinned Chisel helper"]
+async fn upstream_chisel_renewal() {
+    tokio::time::timeout(Duration::from_secs(20), renewal(true))
+        .await
+        .unwrap();
+}
+#[tokio::test]
+#[ignore = "requires pinned Chisel helper"]
+async fn upstream_chisel_fleet_control() {
+    tokio::time::timeout(Duration::from_secs(25), managed_acceptance(true))
+        .await
+        .unwrap();
+}
+
+async fn forward(
+    chisel: bool,
+    listener: TcpListener,
+    url: String,
+    token: String,
+    stop: CancellationToken,
+) -> trusted_router_transport::Result<()> {
+    if chisel {
+        let binary = std::env::var_os("TRUSTED_ROUTER_TUNNEL_BINARY").expect("build pinned helper");
+        edge::forward_chisel(std::path::Path::new(&binary), listener, url, token, stop).await
+    } else {
+        edge::forward(listener, url, token, stop).await
+    }
 }

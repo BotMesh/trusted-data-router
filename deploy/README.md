@@ -9,8 +9,9 @@ The image workflow builds on pull requests and publishes
 `ghcr.io/attestx/trusted-data-router:sha-<full-commit>` on main/manual runs, plus
 version tags on `v*` tags. Select a published digest for deployment. The image
 includes all CLI modes and the pinned Chisel process adapter; this Compose runs
-only `relay`. The adapter is not yet connected to the relay's authorization
-endpoints, so including it does not switch the deployed transport.
+only `relay` and enables the helper through `TRUSTED_ROUTER_TUNNEL_BINARY`.
+Existing nodes can still use the legacy endpoints. Migration is not yet cleared:
+see [the handover blocker](https://github.com/attestx/trusted-data-router/issues/11).
 
 1. Copy `.env.example` to a private file outside the repository. Set the image,
    Fleet HTTPS origin, enrolled router ID, grant issuer and absolute directories.

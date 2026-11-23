@@ -29,4 +29,6 @@ jobs:
       - name: Test upstream process lifecycle and TCP semantics
         env:
           TRUSTED_ROUTER_TUNNEL_BINARY: ${{ runner.temp }}/trusted-router-tunnel
-        run: cargo test --locked -p trusted-router-transport --test chisel_process -- --ignored
+        run: |
+          cargo test --locked -p trusted-router-transport --test chisel_process -- --ignored
+          cargo test --locked -p trusted-router-transport --test data_plane upstream_chisel -- --ignored

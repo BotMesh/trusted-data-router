@@ -13,6 +13,7 @@ services:
       nofile: {soft: 65536, hard: 65536}
     command: [relay, '127.0.0.1:7800', /var/lib/router/relay.sqlite, /etc/router/grant-public.pem, '${TRUSTED_ROUTER_ISSUER:?Set the enrolled grant issuer}']
     environment:
+      TRUSTED_ROUTER_TUNNEL_BINARY: /usr/local/bin/trusted-router-tunnel
       TRUSTED_ROUTER_FLEET_URL: ${TRUSTED_ROUTER_FLEET_URL:?Set the Fleet HTTPS origin}
       TRUSTED_ROUTER_ID: ${TRUSTED_ROUTER_ID:?Set the enrolled router ID}
       TRUSTED_ROUTER_TOKEN_FILE: /etc/router/router-sync.token
