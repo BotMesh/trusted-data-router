@@ -19,6 +19,10 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tunnel/chisel/go.mod
+          cache-dependency-path: tunnel/chisel/go.sum
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-09-17
@@ -29,6 +33,8 @@ jobs:
           mkdir -p target/image
           cargo build --locked --release -p trusted-router-transport --bin trusted-data-router
           install -m 755 target/release/trusted-data-router target/image/
+          (cd tunnel/chisel && CGO_ENABLED=0 go build -trimpath -o ../../target/image/trusted-router-tunnel .)
+          cp tunnel/chisel/NOTICE target/image/NOTICE
           cp deploy/Dockerfile target/image/Dockerfile
       - name: Build and check image
         run: |
@@ -38,7 +44,7 @@ jobs:
           echo "REVISION=$REVISION" >> "$GITHUB_ENV"
           docker build --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.revision=$REVISION" -t "$IMAGE:sha-$REVISION" target/image
-          docker run --rm --entrypoint sh "$IMAGE:sha-$REVISION" -c 'test -x /usr/local/bin/trusted-data-router'
+          docker run --rm --entrypoint sh "$IMAGE:sha-$REVISION" -c 'test -x /usr/local/bin/trusted-data-router && test -x /usr/local/bin/trusted-router-tunnel'
       - name: Publish to GHCR
         if: github.event_name != 'pull_request'
         env:

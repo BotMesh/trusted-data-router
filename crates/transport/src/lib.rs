@@ -2,6 +2,7 @@
 //! so transport upgrades do not change the proof guest's dependency graph.
 pub use trusted_data_router::{Error, Result};
 pub mod authorization;
+pub mod chisel;
 pub mod control;
 pub mod edge;
 pub mod grants;

@@ -8,7 +8,9 @@ connection. One active relay owns each router ID and SQLite database.
 The image workflow builds on pull requests and publishes
 `ghcr.io/attestx/trusted-data-router:sha-<full-commit>` on main/manual runs, plus
 version tags on `v*` tags. Select a published digest for deployment. The image
-includes all CLI modes; this Compose runs only `relay`.
+includes all CLI modes and the pinned Chisel process adapter; this Compose runs
+only `relay`. The adapter is not yet connected to the relay's authorization
+endpoints, so including it does not switch the deployed transport.
 
 1. Copy `.env.example` to a private file outside the repository. Set the image,
    Fleet HTTPS origin, enrolled router ID, grant issuer and absolute directories.

@@ -181,9 +181,10 @@ attestation; those proofs and OpenShell enforcement belong in rail/shim.
 
 ## Reuse and integration
 
-The current transport composes Rust protocol libraries; it has not yet integrated
-an upstream tunnel service. Prefer reusing that service while retaining Fleet
-admission, exact-instance routing and per-connection revocation in this router.
+The default transport still composes Rust protocol libraries. A private process
+adapter for upstream Chisel is implemented and tested below; it is not yet wired
+to the public relay endpoints or shim. Fleet admission, exact-instance routing
+and per-connection revocation remain the Router's responsibility.
 
 [`tools/test_upstream_tunnels.py`](tools/test_upstream_tunnels.py) compares unmodified
 upstream binaries with two loopback services, verified WSS certificates, 512 KiB
@@ -205,15 +206,36 @@ Chisel, removal means narrowing the authfile on a connected reverse tunnel;
 it does not remove that tunnel's existing listener. Stopping a shared client
 closes both services, so it is not selective tenant revocation.
 
-Chisel 1.12.0 is the preferred next transport candidate from these results: it
-preserves TCP half-close over WSS. It is Go, so use its stock executable rather
-than rewriting it in Rust. This is **not an implemented backend or migration
-approval**. The adapter must keep reverse listeners private, verify server
-identity, constrain each enrollment's listeners and local targets, and close
-streams at the router's authorization boundary on revocation or lease expiry.
-Test malicious route registration, isolated NAT/reconnect, HTTP/SSE/WebSocket,
-real SSH/rsync and unchanged app credentials before replacing the current path.
-These local transport tests do not establish tenant authorization or NAT behavior.
+[`tunnel/chisel`](tunnel/chisel) pins Chisel 1.12.0 without modifying upstream.
+Its small Go launcher calls the native server/client APIs; Rust owns process
+lifecycle through [`chisel.rs`](crates/transport/src/chisel.rs). This avoids
+placing bearer headers in the stock CLI's command-line arguments: bounded private
+stdin carries credentials, and no new operator configuration file is required.
+The GHCR image includes the helper alongside the Rust binary.
+
+The adapter limits listeners and targets to numeric loopback addresses, pins SSH
+server identity, verifies WSS certificates, and installs exact address ACLs. A
+permanent deny-only user prevents upstream's empty user table from disabling
+authentication. Control-channel failure kills the server; client drop kills its
+process. Deleting a user alone still does **not** close an established tunnel.
+
+Tests cover verified WSS, binary data, server-first traffic, TCP half-close,
+unauthorized reverse listeners and forward SSH channels, empty-table rejection,
+and closing one connector while another stays usable. These are adapter tests,
+**not Fleet tenant-authorization or NAT acceptance**. Pending integration must
+bind each public upgrade to its exact lease, keep reverse ports private, and
+close active streams on route/access revocation and expiry. Then rerun isolated
+NAT/reconnect, HTTP/SSE/WebSocket and real SSH/rsync acceptance before cutover.
+
+Build outside the source tree and run the process acceptance:
+
+```sh
+(cd tunnel/chisel && go test -race ./... && CGO_ENABLED=0 go build -trimpath -o /tmp/trusted-router-tunnel .)
+TRUSTED_ROUTER_TUNNEL_BINARY=/tmp/trusted-router-tunnel \
+  cargo test --locked -p trusted-router-transport --test chisel_process -- --ignored
+```
+
+The standalone comparison with stock release binaries remains available:
 
 ```sh
 python3 tools/test_upstream_tunnels.py \

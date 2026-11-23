@@ -15,6 +15,7 @@ trusted-data-router = { git = "https://github.com/attestx/trusted-data-router", 
 axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
 futures = "0.3"
+getrandom = "0.2"
 hex = "0.4"
 hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
