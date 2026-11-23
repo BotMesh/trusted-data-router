@@ -673,10 +673,15 @@ async fn http_proxy(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpRe
         let _access = connection_access;
         tokio::select! { _ = connection.with_upgrades() => {}, _ = cancellation.cancelled() => {}, _ = expires(grant.exp) => {} }
     });
-    let mut response = tokio::time::timeout(Duration::from_secs(30), sender.send_request(req))
-        .await
-        .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
-        .map_err(|_| StatusCode::BAD_GATEWAY)?;
+    // Uploads, inference and remote exec can legitimately exceed 30 seconds.
+    // Their signed access lifetime bounds the wait; revocation also applies
+    // before response headers arrive, not only to a streaming response body.
+    let mut response = tokio::select! {
+        biased;
+        _ = access.cancel.cancelled() => return Err(StatusCode::FORBIDDEN),
+        _ = expires(grant.exp) => return Err(StatusCode::GATEWAY_TIMEOUT),
+        response = sender.send_request(req) => response.map_err(|_| StatusCode::BAD_GATEWAY)?,
+    };
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         let Some(client_upgrade) = client_upgrade else {
             return Err(StatusCode::BAD_GATEWAY);

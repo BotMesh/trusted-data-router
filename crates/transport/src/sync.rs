@@ -352,7 +352,18 @@ impl ControlClient {
             // Errors never renew a lease. The relay watchdog independently
             // terminates streams, even when this task is blocked or crashes.
             let _ = self.poll_once(&relay).await;
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            // Account for time spent receiving/applying the response. Short
+            // leases must renew before expiry; failures never extend them.
+            let delay = relay
+                .directory
+                .lock()
+                .ok()
+                .and_then(|d| d.control.as_ref().and_then(|c| c.deadline))
+                .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+                .map(|remaining| remaining / 3)
+                .unwrap_or(Duration::from_secs(5))
+                .clamp(Duration::from_millis(100), Duration::from_secs(5));
+            tokio::time::sleep(delay).await;
         }
     }
 }

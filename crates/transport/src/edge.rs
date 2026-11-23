@@ -87,7 +87,7 @@ pub async fn connect(
 /// Makes an unmodified HTTP/SSE/WebSocket client work through authenticated WSS.
 /// Application Authorization headers and paths remain unchanged inside it.
 pub async fn forward(
-    listener: TcpListener,
+    mut listener: TcpListener,
     url: String,
     token: String,
     stop: CancellationToken,
@@ -99,8 +99,9 @@ pub async fn forward(
         tokio::select! {
             _ = stop.cancelled() => break,
             _ = tasks.join_next(), if !tasks.is_empty() => {},
-            socket = listener.accept() => {
-                let (mut tcp, _) = socket.map_err(|_| Error::Unavailable)?;
+            // Reuse axum's accept-error handling: retry connection errors and
+            // back off on resource exhaustion without dropping active streams.
+            (mut tcp, _) = axum::serve::Listener::accept(&mut listener) => {
                 let Ok(slot) = slots.clone().try_acquire_owned() else { continue; };
                 let (url, token) = (url.clone(), token.clone());
                 tasks.spawn(async move {

@@ -156,6 +156,13 @@ with a fresh token when expired. The relay closes established streams at access
 expiry, registration expiry, connector disconnect and revocation. HTTP/1 and WS
 upgrades are supported by the HTTP endpoint. The raw tunnel can carry other TCP
 protocols, including HTTP/2; it does not open arbitrary destinations on the node.
+The forwarder reuses axum's accept retry/backoff so transient socket errors or
+file-descriptor exhaustion do not tear down established streams. New connections
+resume when resources become available; explicit shutdown still drains all streams.
+TCP half-close remains unsupported: a write EOF closes the WebSocket tunnel, so
+protocols that wait for EOF before replying can lose their response. This must be
+resolved before migrating such protocols. SQLite commits also remain synchronous
+on the relay request path; large reconnect bursts still need load validation.
 No inbound port is required on the edge node. Plain `ws://` is accepted only for
 numeric loopback integration tests.
 

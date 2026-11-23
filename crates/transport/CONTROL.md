@@ -32,7 +32,10 @@ replacement token in the same namespace, then atomically replacing its file;
 the epoch and all revocations survive rotation. Never place an administrator or
 cluster token on the relay.
 
-The relay initiates `POST /routers/relay-a/sync` every five seconds. HTTPS is
+The relay waits at most five seconds after a poll before starting the next
+`POST /routers/relay-a/sync`. For shorter leases it waits one third of the remaining lease (minimum
+100 ms), accounting for response and commit time. Failed polls never extend the
+lease; an expired lease still drains active streams. HTTPS is
 required except for numeric loopback test endpoints. Redirects are refused;
 requests time out after ten seconds and responses are bounded to 1 MiB.
 The initial request has `epoch:null`, `after_revision:0`, `applied_revision:null`.
@@ -207,6 +210,12 @@ POST `/v1/runtime/connections` with `Authorization: Bearer <Fleet token>`:
 ```
 
 Returns one descriptor per current ready execution: execution identity, service, opaque `route_id`, HTTPS `base_url`, access `token`, and `expires_at`. Use `X-Trusted-Access: <token>` on the relay. Preserve the application's native Authorization header. Tokens expire after 15 minutes; refresh before a new request. Refresh with the same `execution` or `route_id` to preserve stateful affinity. An expired/removed instance returns 503; it is never redirected to a replacement. An active stream ends at grant expiry; do not replay state-changing requests automatically.
+
+Waiting for HTTP response headers uses that same access deadline, including for
+long uploads, inference and remote exec; there is no separate 30-second cutoff.
+Revocation and connector/control lease expiry still terminate the connection.
+Applications and upstream TLS proxies may impose shorter deadlines. A disconnect
+does not establish whether a mutation completed; reconcile instead of replaying it.
 
 `route_id` is the SHA-256 of the canonical serialized `[issuer, execution, service]`
 tuple. A shim registers an outbound connection under this ID. The relay checks the

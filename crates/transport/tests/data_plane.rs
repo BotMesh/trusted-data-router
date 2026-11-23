@@ -74,6 +74,13 @@ async fn application() -> (
             }),
             Router::new()
                 .route("/echo", get(echo))
+                .route(
+                    "/slow",
+                    get(|| async {
+                        tokio::time::sleep(Duration::from_secs(31)).await;
+                        "completed"
+                    }),
+                )
                 .route("/events", get(events))
                 .route("/ws", get(ws)),
         )
@@ -85,7 +92,7 @@ async fn application() -> (
 
 #[tokio::test]
 async fn outbound_http_sse_websocket_auth_expiry_revocation_and_recovery() {
-    tokio::time::timeout(Duration::from_secs(35), acceptance())
+    tokio::time::timeout(Duration::from_secs(50), acceptance())
         .await
         .unwrap();
 }
@@ -347,15 +354,22 @@ async fn managed_acceptance() {
         "from_revision":0,"revision":0,"revoked_routes":[],"lease_seconds":30}),
     ));
     let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let response_delay = Arc::new(AtomicUsize::new(0));
     let control = Router::new().route(
         "/routers/relay-a/sync",
         axum::routing::post({
             let response = response.clone();
             let requests = requests.clone();
+            let response_delay = response_delay.clone();
             move |headers: HeaderMap, axum::Json(request): axum::Json<Value>| {
                 let response = response.clone();
                 let requests = requests.clone();
+                let response_delay = response_delay.clone();
                 async move {
+                    tokio::time::sleep(Duration::from_millis(
+                        response_delay.load(Ordering::SeqCst) as u64,
+                    ))
+                    .await;
                     assert_eq!(headers["authorization"], "Bearer router-only");
                     assert_eq!(
                         headers["x-fleet-router-capabilities"],
@@ -553,6 +567,28 @@ async fn managed_acceptance() {
         .unwrap()
         .bytes_stream();
     assert!(stream.next().await.unwrap().is_ok());
+    // A healthy but delayed control plane grants one-second leases. The
+    // background poller must preserve this same stream across renewals.
+    response_delay.store(200, Ordering::SeqCst);
+    let poller = tokio::spawn(
+        ControlClient::new(
+            &control_url,
+            "relay-a".into(),
+            temp.path().join("router.token"),
+        )
+        .unwrap()
+        .run(relay.clone()),
+    );
+    let until = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < until {
+        assert!(stream
+            .next()
+            .await
+            .expect("short lease dropped a healthy stream")
+            .is_ok());
+    }
+    poller.abort();
+    let _ = poller.await;
     control_task.abort();
     assert!(client.poll_once(&relay).await.is_err());
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -711,6 +747,30 @@ async fn acceptance() {
             .status(),
         401
     );
+    // A slow inference/exec response must outlive the old fixed 30-second
+    // cutoff, while a shorter signed access lifetime remains authoritative.
+    let slow = http
+        .get(format!("{base}/slow"))
+        .header("x-trusted-access", &access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(slow.status(), 200);
+    assert_eq!(slow.text().await.unwrap(), "completed");
+    let mut short = grant.clone();
+    short.purpose = Purpose::Access;
+    short.nbf = grants::now();
+    short.exp = short.nbf + 1;
+    let expired = tokio::time::timeout(
+        Duration::from_secs(3),
+        http.get(format!("{base}/slow"))
+            .header("x-trusted-access", grants::sign(&key, &short).unwrap())
+            .send(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(expired.status().as_u16(), 502 | 504));
     let before_invalid = accepts.load(Ordering::SeqCst);
     assert!(
         before_invalid > 0,
