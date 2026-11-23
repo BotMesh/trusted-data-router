@@ -1,0 +1,70 @@
+name: trusted-data-router
+services:
+  router:
+    image: ${TRUSTED_ROUTER_IMAGE:?Set an immutable GHCR image tag or digest}
+    user: ${TRUSTED_ROUTER_UID:-10001}:${TRUSTED_ROUTER_GID:-10001}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
+    command: [relay, '127.0.0.1:7800', /var/lib/router/relay.sqlite, /etc/router/grant-public.pem, '${TRUSTED_ROUTER_ISSUER:?Set the enrolled grant issuer}']
+    environment:
+      TRUSTED_ROUTER_TUNNEL_BINARY: /usr/local/bin/trusted-router-tunnel
+      TRUSTED_ROUTER_FLEET_URL: ${TRUSTED_ROUTER_FLEET_URL:?Set the Fleet HTTPS origin}
+      TRUSTED_ROUTER_ID: ${TRUSTED_ROUTER_ID:?Set the enrolled router ID}
+      TRUSTED_ROUTER_TOKEN_FILE: /etc/router/router-sync.token
+      TRUSTED_ROUTER_FLEET_CA_FILE: ${TRUSTED_ROUTER_FLEET_CA_FILE:-/etc/ssl/certs/ca-certificates.crt}
+      TRUSTED_ROUTER_ORIGINS: ${TRUSTED_ROUTER_ORIGINS:-}
+    volumes:
+      - type: bind
+        source: ${TRUSTED_ROUTER_STATE:?Set an existing private state directory}
+        target: /var/lib/router
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${TRUSTED_ROUTER_CONFIG:?Set an existing private config directory}
+        target: /etc/router
+        read_only: true
+        bind: {create_host_path: false}
+    # The TLS proxy shares this network namespace. Plaintext stays on loopback.
+    ports: ['${TRUSTED_ROUTER_BIND:-0.0.0.0}:${TRUSTED_ROUTER_PORT:-443}:8443']
+    healthcheck:
+      test: [CMD, curl, -fsS, --max-time, '2', 'http://127.0.0.1:7800/healthz']
+      interval: 15s
+      timeout: 3s
+      retries: 3
+  tls:
+    image: nginx:1.28-alpine
+    user: ${TRUSTED_ROUTER_UID:-10001}:${TRUSTED_ROUTER_GID:-10001}
+    network_mode: service:router
+    depends_on:
+      router:
+        condition: service_healthy
+        restart: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    ulimits:
+      nofile: {soft: 8192, hard: 8192}
+    entrypoint: [nginx, -g, 'daemon off;']
+    volumes:
+      - type: bind
+        source: ./nginx.conf
+        target: /etc/nginx/nginx.conf
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${TRUSTED_ROUTER_TLS:?Set the existing TLS certificate directory}
+        target: /etc/router-tls
+        read_only: true
+        bind: {create_host_path: false}
+    healthcheck:
+      test: [CMD, wget, -q, --spider, --no-check-certificate, 'https://127.0.0.1:8443/healthz']
+      interval: 15s
+      timeout: 3s
+      retries: 3
