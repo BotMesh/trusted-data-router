@@ -161,8 +161,12 @@ file-descriptor exhaustion do not tear down established streams. New connections
 resume when resources become available; explicit shutdown still drains all streams.
 TCP half-close remains unsupported: a write EOF closes the WebSocket tunnel, so
 protocols that wait for EOF before replying can lose their response. This must be
-resolved before migrating such protocols. SQLite commits also remain synchronous
-on the relay request path; large reconnect bursts still need load validation.
+resolved before migrating such protocols. Durable transitions run serially on a
+blocking worker without holding the in-memory routing lock during SQLite I/O.
+Unchanged control snapshots and same-execution reconnects skip writes. Changes
+are published only after commit, even if the requesting client disconnects;
+control-lease expiry remains independent of disk latency. Large reconnect bursts
+still need deployment-specific load validation.
 No inbound port is required on the edge node. Plain `ws://` is accepted only for
 numeric loopback integration tests.
 

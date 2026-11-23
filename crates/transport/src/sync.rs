@@ -101,7 +101,8 @@ impl Relay {
             .is_some())
     }
     pub fn bind_control(&self, client: &ControlClient) -> Result<()> {
-        let mut directory = self.directory.lock().map_err(|_| Error::Unavailable)?;
+        let db = self.db.lock().map_err(|_| Error::Unavailable)?;
+        let directory = self.directory.lock().map_err(|_| Error::Unavailable)?;
         if let Some(state) = &directory.control {
             if state.authority != client.authority
                 || state.router_id != client.router_id
@@ -120,13 +121,13 @@ impl Relay {
             authorization: None,
             deadline: None,
         };
-        directory
-            .db
-            .execute(
-                "INSERT INTO control(singleton,state) VALUES(1,?1)",
-                [serde_json::to_string(&state).map_err(|_| Error::InvalidContract)?],
-            )
-            .map_err(|_| Error::Unavailable)?;
+        drop(directory);
+        db.execute(
+            "INSERT INTO control(singleton,state) VALUES(1,?1)",
+            [serde_json::to_string(&state).map_err(|_| Error::InvalidContract)?],
+        )
+        .map_err(|_| Error::Unavailable)?;
+        let mut directory = self.directory.lock().map_err(|_| Error::Unavailable)?;
         directory.control = Some(state);
         let _ = directory.check_control();
         Ok(())
@@ -157,84 +158,100 @@ impl Relay {
             applied_authorization_revision: state.authorization.as_ref().map(|a| a.revision),
         })
     }
-    fn apply_control(
+    async fn apply_control(
         &self,
         client: &ControlClient,
         request: &SyncRequest,
         update: &SyncResponse,
         started: Instant,
     ) -> Result<()> {
-        let mut directory = self.directory.lock().map_err(|_| Error::Unavailable)?;
-        // Never preserve an old connection across an expired control lease,
-        // even if this response races the watchdog's next tick.
-        let _ = directory.check_control();
-        let state = directory.control.as_ref().ok_or(Error::InvalidContract)?;
-        if state.authority != client.authority
-            || state.router_id != update.router_id
-            || state.issuer != update.issuer
-            || state.epoch != request.epoch
-            || state.revision != request.after_revision
-            || state.epoch.as_ref().is_some_and(|e| e != &update.epoch)
-            || update.epoch.len() != 32
-            || !update.epoch.bytes().all(|b| b.is_ascii_hexdigit())
-            || update.from_revision != state.revision
-            || update.revision < state.revision
-            || update.revision > MAX_REVOCATIONS as u64
-            || update.revision - update.from_revision != update.revoked_routes.len() as u64
-            || !update.revoked_routes.iter().all(|r| valid_route(r))
-            || update
-                .revoked_routes
-                .iter()
-                .collect::<std::collections::HashSet<_>>()
-                .len()
-                != update.revoked_routes.len()
-            || !(1..=30).contains(&update.lease_seconds)
-        {
-            return Err(Error::InvalidContract);
-        }
-        match &update.authorization {
-            Some(auth) => auth.validate(state.authorization.as_ref())?,
-            None if state.authorization.is_some() => return Err(Error::InvalidContract),
-            None => {}
-        }
-        let deadline = started + Duration::from_secs(update.lease_seconds.into());
-        if deadline <= Instant::now() {
-            return Err(Error::StaleExecution);
-        }
-        let next = ManagedControl {
-            epoch: Some(update.epoch.clone()),
-            revision: update.revision,
-            authorization: update.authorization.clone(),
-            deadline: Some(deadline),
-            ..state.clone()
-        };
-        let transaction = directory.db.transaction().map_err(|_| Error::Unavailable)?;
-        for route in &update.revoked_routes {
-            transaction
-                .execute("INSERT OR IGNORE INTO revoked(route) VALUES(?1)", [route])
-                .map_err(|_| Error::Unavailable)?;
-        }
-        transaction
-            .execute(
-                "UPDATE control SET state=?1 WHERE singleton=1",
-                [serde_json::to_string(&next).map_err(|_| Error::InvalidContract)?],
-            )
-            .map_err(|_| Error::Unavailable)?;
-        transaction.commit().map_err(|_| Error::Unavailable)?;
-        for route in &update.revoked_routes {
-            if let Some(session) = directory.sessions.remove(route) {
-                session.cancel.cancel();
+        let authority = client.authority.clone();
+        let request = request.clone();
+        let update = update.clone();
+        self.persist(move |db, directory| {
+            let mut view = directory.lock().map_err(|_| Error::Unavailable)?;
+            // Never preserve an old connection across an expired control lease,
+            // even if this response races the watchdog's next tick.
+            let _ = view.check_control();
+            let state = view.control.clone().ok_or(Error::InvalidContract)?;
+            drop(view);
+            if state.authority != authority
+                || state.router_id != update.router_id
+                || state.issuer != update.issuer
+                || state.epoch != request.epoch
+                || state.revision != request.after_revision
+                || state.epoch.as_ref().is_some_and(|e| e != &update.epoch)
+                || update.epoch.len() != 32
+                || !update.epoch.bytes().all(|b| b.is_ascii_hexdigit())
+                || update.from_revision != state.revision
+                || update.revision < state.revision
+                || update.revision > MAX_REVOCATIONS as u64
+                || update.revision - update.from_revision != update.revoked_routes.len() as u64
+                || !update.revoked_routes.iter().all(|r| valid_route(r))
+                || update
+                    .revoked_routes
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    != update.revoked_routes.len()
+                || !(1..=30).contains(&update.lease_seconds)
+            {
+                return Err(Error::InvalidContract);
             }
-        }
-        if let Some(auth) = &next.authorization {
-            for stream in directory.streams.values() {
-                if !auth.allows(&stream.grant) {
-                    stream.cancel.cancel();
+            match &update.authorization {
+                Some(auth) => auth.validate(state.authorization.as_ref())?,
+                None if state.authorization.is_some() => return Err(Error::InvalidContract),
+                None => {}
+            }
+            let deadline = started + Duration::from_secs(update.lease_seconds.into());
+            if deadline <= Instant::now() {
+                return Err(Error::StaleExecution);
+            }
+            let next = ManagedControl {
+                epoch: Some(update.epoch.clone()),
+                revision: update.revision,
+                authorization: update.authorization.clone(),
+                deadline: Some(deadline),
+                ..state.clone()
+            };
+            if next.epoch != state.epoch
+                || next.revision != state.revision
+                || next.authorization != state.authorization
+            {
+                let transaction = db.transaction().map_err(|_| Error::Unavailable)?;
+                for route in &update.revoked_routes {
+                    transaction
+                        .execute("INSERT OR IGNORE INTO revoked(route) VALUES(?1)", [route])
+                        .map_err(|_| Error::Unavailable)?;
+                }
+                transaction
+                    .execute(
+                        "UPDATE control SET state=?1 WHERE singleton=1",
+                        [serde_json::to_string(&next).map_err(|_| Error::InvalidContract)?],
+                    )
+                    .map_err(|_| Error::Unavailable)?;
+                transaction.commit().map_err(|_| Error::Unavailable)?;
+            }
+            let mut directory = directory.lock().map_err(|_| Error::Unavailable)?;
+            // Disk latency must not hide expiry of the previous control lease.
+            let _ = directory.check_control();
+            for route in &update.revoked_routes {
+                if let Some(session) = directory.sessions.remove(route) {
+                    session.cancel.cancel();
                 }
             }
-        }
-        directory.control = Some(next);
-        Ok(())
+            if let Some(auth) = &next.authorization {
+                for stream in directory.streams.values() {
+                    if !auth.allows(&stream.grant) {
+                        stream.cancel.cancel();
+                    }
+                }
+            }
+            directory.control = Some(next);
+            let _ = directory.check_control();
+            Ok(())
+        })
+        .await?
     }
 }
 
@@ -345,7 +362,7 @@ impl ControlClient {
         }
         let update: SyncResponse =
             serde_json::from_slice(&body).map_err(|_| Error::InvalidContract)?;
-        relay.apply_control(self, &request, &update, started)
+        relay.apply_control(self, &request, &update, started).await
     }
     pub async fn run(self, relay: Arc<Relay>) {
         loop {

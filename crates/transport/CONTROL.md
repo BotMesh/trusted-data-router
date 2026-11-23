@@ -48,6 +48,11 @@ The relay commits tombstones and cursor together in SQLite, then cancels affecte
 sessions before advertising that revision as applied in the next request. This
 acknowledges local enforcement; it is not a cryptographic policy proof or a
 guarantee that previously delivered application bytes can be retracted.
+Runtime database operations run on a serialized blocking worker. Routing and the
+lease watchdog do not wait on disk I/O; unchanged snapshots refresh only the
+in-memory deadline. Once a commit starts, cancellation of its caller does not
+skip publication and stream cancellation. Startup database opening and control
+binding are synchronous and must complete before serving traffic.
 `GET /routers/relay-a` (administrator only) reports `delivered_revision`,
 `applied_revision` and `applied_ms`; a submitted revocation is not an applied one.
 

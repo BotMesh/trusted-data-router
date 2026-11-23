@@ -63,7 +63,6 @@ impl Session {
     }
 }
 pub(crate) struct Directory {
-    pub(crate) db: Connection,
     pub(crate) sessions: HashMap<String, Arc<Session>>,
     pub(crate) control: Option<crate::sync::ManagedControl>,
     pub(crate) streams: HashMap<u64, AccessStream>,
@@ -77,6 +76,29 @@ struct AccessGuard {
     relay: std::sync::Weak<Relay>,
     cancel: CancellationToken,
 }
+// Also owns cleanup when an HTTP registration caller disconnects while its
+// durable transition is still running. A newer session is never removed.
+struct RegisteredSession {
+    relay: std::sync::Weak<Relay>,
+    route: String,
+    session: Arc<Session>,
+}
+impl Drop for RegisteredSession {
+    fn drop(&mut self) {
+        self.session.cancel.cancel();
+        if let Some(relay) = self.relay.upgrade() {
+            if let Ok(mut directory) = relay.directory.lock() {
+                if directory
+                    .sessions
+                    .get(&self.route)
+                    .is_some_and(|s| s.serial == self.session.serial)
+                {
+                    directory.sessions.remove(&self.route);
+                }
+            }
+        }
+    }
+}
 impl Drop for AccessGuard {
     fn drop(&mut self) {
         if let Some(relay) = self.relay.upgrade() {
@@ -88,7 +110,9 @@ impl Drop for AccessGuard {
 }
 pub struct Relay {
     pub(crate) verifier: Verifier,
-    pub(crate) directory: Mutex<Directory>,
+    pub(crate) directory: Arc<Mutex<Directory>>,
+    pub(crate) db: Arc<Mutex<Connection>>,
+    storage_slot: Arc<Semaphore>,
     serial: AtomicU64,
     watchdog_started: AtomicBool,
 }
@@ -113,15 +137,39 @@ impl Relay {
             .map_err(|_| crate::Error::InvalidContract)?;
         Ok(Arc::new(Self {
             verifier,
-            directory: Mutex::new(Directory {
-                db,
+            directory: Arc::new(Mutex::new(Directory {
                 control,
                 sessions: HashMap::new(),
                 streams: HashMap::new(),
-            }),
+            })),
+            db: Arc::new(Mutex::new(db)),
+            storage_slot: Arc::new(Semaphore::new(1)),
             serial: AtomicU64::new(1),
             watchdog_started: AtomicBool::new(false),
         }))
+    }
+    /// Serialize durable transitions off the async workers. The closure owns
+    /// the permit through commit and publication even if its caller disconnects.
+    /// Never hold the directory lock while accessing SQLite.
+    pub(crate) async fn persist<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&mut Connection, &Mutex<Directory>) -> T + Send + 'static,
+    ) -> crate::Result<T> {
+        let permit = self
+            .storage_slot
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| crate::Error::Unavailable)?;
+        let db = self.db.clone();
+        let directory = self.directory.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut db = db.lock().map_err(|_| crate::Error::Unavailable)?;
+            Ok(work(&mut db, &directory))
+        })
+        .await
+        .map_err(|_| crate::Error::Unavailable)?
     }
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
@@ -339,74 +387,63 @@ fn has_token(headers: &HeaderMap, name: &str, token: &str) -> bool {
     })
 }
 
-async fn connect(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResult {
-    let grant = relay.authenticate(&req, Purpose::Register)?;
-    let (response, upgraded) = upgrade(&mut req)?;
-    let route = grant.route_id();
-    let (tx, mut rx) = mpsc::channel::<Open>(64);
-    let cancel = CancellationToken::new();
-    let session = Arc::new(Session {
-        expires_at: AtomicU64::new(grant.exp),
-        renewed: Notify::new(),
-        grant,
-        serial: relay.serial.fetch_add(1, Ordering::Relaxed),
-        open: tx,
-        cancel: cancel.clone(),
-        slots: Arc::new(Semaphore::new(256)),
-    });
-    {
-        let mut directory = relay
-            .directory
-            .lock()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        directory.check_control()?;
-        let revoked: bool = directory
-            .db
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM revoked WHERE route=?1)",
-                [&route],
-                |row| row.get(0),
-            )
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        if revoked {
-            return Err(StatusCode::FORBIDDEN);
-        }
-        if directory.sessions.contains_key(&route) {
-            return Err(StatusCode::CONFLICT);
-        }
-        if directory.sessions.len() >= 1024 {
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
-        // Node-local allocation generations are fenced within their authority.
-        // Cross-node replacement still requires the gateway to revoke the old
-        // exact execution; no node is permitted to invent a global generation.
-        let e = &session.grant.execution;
-        let slot = serde_json::to_string(&(
-            &session.grant.iss,
-            &session.grant.service,
-            &e.allocation_id,
-            &e.node_id,
-        ))
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-        let policy =
-            serde_json::to_string(&session.grant.policy).map_err(|_| StatusCode::BAD_REQUEST)?;
-        let generation = i64::try_from(e.generation).map_err(|_| StatusCode::BAD_REQUEST)?;
-        let previous: Option<(i64, String, String)> = directory
-            .db
-            .query_row(
-                "SELECT generation,route,policy FROM generations WHERE slot=?1",
-                [&slot],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        if previous.as_ref().is_some_and(|(g, r, p)| {
-            *g > generation || *g == generation && (r != &route || p != &policy)
-        }) {
-            return Err(StatusCode::CONFLICT);
-        }
-        let transaction = directory
-            .db
+fn register_session(
+    db: &mut Connection,
+    directory: &Mutex<Directory>,
+    session: Arc<Session>,
+    owner: std::sync::Weak<Relay>,
+) -> std::result::Result<RegisteredSession, StatusCode> {
+    let route = session.grant.route_id();
+    let mut view = directory
+        .lock()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    view.check_control()?;
+    if view.sessions.contains_key(&route) {
+        return Err(StatusCode::CONFLICT);
+    }
+    if view.sessions.len() >= 1024 {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    drop(view);
+    let revoked: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM revoked WHERE route=?1)",
+            [&route],
+            |row| row.get(0),
+        )
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    if revoked {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    // Node-local allocation generations are fenced within their authority.
+    // Cross-node replacement still requires the gateway to revoke the old
+    // exact execution; no node is permitted to invent a global generation.
+    let e = &session.grant.execution;
+    let slot = serde_json::to_string(&(
+        &session.grant.iss,
+        &session.grant.service,
+        &e.allocation_id,
+        &e.node_id,
+    ))
+    .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let policy =
+        serde_json::to_string(&session.grant.policy).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let generation = i64::try_from(e.generation).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let previous: Option<(i64, String, String)> = db
+        .query_row(
+            "SELECT generation,route,policy FROM generations WHERE slot=?1",
+            [&slot],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    if previous.as_ref().is_some_and(|(g, r, p)| {
+        *g > generation || *g == generation && (r != &route || p != &policy)
+    }) {
+        return Err(StatusCode::CONFLICT);
+    }
+    if previous.as_ref() != Some(&(generation, route.clone(), policy.clone())) {
+        let transaction = db
             .transaction()
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         transaction.execute("INSERT INTO generations(slot,generation,route,policy) VALUES(?1,?2,?3,?4)
@@ -422,15 +459,49 @@ async fn connect(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResul
         transaction
             .commit()
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        if let Some((_, old, _)) = previous {
-            if old != route {
-                if let Some(old) = directory.sessions.remove(&old) {
-                    old.cancel.cancel();
-                }
+    }
+    let mut directory = directory
+        .lock()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    if let Some((_, old, _)) = previous {
+        if old != route {
+            if let Some(old) = directory.sessions.remove(&old) {
+                old.cancel.cancel();
             }
         }
-        directory.sessions.insert(route.clone(), session.clone());
     }
+    directory.check_control()?;
+    if session.expires_at.load(Ordering::Acquire) <= grants::now() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    directory.sessions.insert(route.clone(), session.clone());
+    Ok(RegisteredSession {
+        relay: owner,
+        route,
+        session,
+    })
+}
+
+async fn connect(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResult {
+    let grant = relay.authenticate(&req, Purpose::Register)?;
+    let (response, upgraded) = upgrade(&mut req)?;
+    let (tx, mut rx) = mpsc::channel::<Open>(64);
+    let cancel = CancellationToken::new();
+    let session = Arc::new(Session {
+        expires_at: AtomicU64::new(grant.exp),
+        renewed: Notify::new(),
+        grant,
+        serial: relay.serial.fetch_add(1, Ordering::Relaxed),
+        open: tx,
+        cancel: cancel.clone(),
+        slots: Arc::new(Semaphore::new(256)),
+    });
+    let owner = Arc::downgrade(&relay);
+    let pending = session.clone();
+    let registered = relay
+        .persist(move |db, directory| register_session(db, directory, pending, owner))
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)??;
     tokio::spawn(async move {
         let run = async {
             let io = TokioIo::new(upgraded.await.map_err(|_| ())?);
@@ -457,16 +528,7 @@ async fn connect(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResul
             Ok::<(), ()>(())
         };
         tokio::select! { _ = run => {}, _ = cancel.cancelled() => {}, _ = session.expired() => {} }
-        cancel.cancel();
-        if let Ok(mut directory) = relay.directory.lock() {
-            if directory
-                .sessions
-                .get(&route)
-                .is_some_and(|s| s.serial == session.serial)
-            {
-                directory.sessions.remove(&route);
-            }
-        }
+        drop(registered);
     });
     Ok(response)
 }
@@ -567,20 +629,23 @@ async fn tunnel(State(relay): State<Arc<Relay>>, mut req: Request) -> HttpResult
 async fn revoke(State(relay): State<Arc<Relay>>, req: Request) -> HttpResult {
     let grant = relay.authenticate(&req, Purpose::Revoke)?;
     let route = grant.route_id();
-    let mut directory = relay
-        .directory
-        .lock()
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    directory
-        .db
-        .execute(
-            "INSERT OR IGNORE INTO revoked(route) VALUES(?1)",
-            params![route],
-        )
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    if let Some(session) = directory.sessions.remove(&route) {
-        session.cancel.cancel();
-    }
+    relay
+        .persist(move |db, directory| {
+            db.execute(
+                "INSERT OR IGNORE INTO revoked(route) VALUES(?1)",
+                params![route],
+            )
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            let mut directory = directory
+                .lock()
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            if let Some(session) = directory.sessions.remove(&route) {
+                session.cancel.cancel();
+            }
+            Ok::<_, StatusCode>(())
+        })
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)??;
     Ok(Response::builder().status(204).body(Body::empty()).unwrap())
 }
 

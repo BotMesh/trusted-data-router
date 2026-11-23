@@ -455,6 +455,17 @@ async fn managed_acceptance() {
         requests.lock().unwrap()[0],
         json!({"epoch":null,"after_revision":0,"applied_revision":null})
     );
+    let storage = rusqlite::Connection::open(&database).unwrap();
+    storage
+        .execute_batch(
+            "CREATE TRIGGER no_control_refresh BEFORE UPDATE ON control
+        BEGIN SELECT RAISE(ABORT, 'unchanged control state must not be written'); END;",
+        )
+        .unwrap();
+    client.poll_once(&relay).await.unwrap();
+    storage
+        .execute_batch("DROP TRIGGER no_control_refresh;")
+        .unwrap();
     let stop = CancellationToken::new();
     let start = |g: &Grant| {
         let url = format!("ws://{addr}/v1/connect/{}", g.route_id());
@@ -589,6 +600,100 @@ async fn managed_acceptance() {
     }
     poller.abort();
     let _ = poller.await;
+    response_delay.store(0, Ordering::SeqCst);
+    client.poll_once(&relay).await.unwrap();
+    // A real SQLite writer lock stalls persistence, not the async worker or
+    // directory. Unrelated traffic and the lease watchdog must keep running.
+    storage.execute_batch("BEGIN IMMEDIATE").unwrap();
+    response.lock().unwrap()["revision"] = json!(2);
+    response.lock().unwrap()["revoked_routes"] = json!([next.route_id()]);
+    let blocked = tokio::spawn({
+        let relay = relay.clone();
+        let client = ControlClient::new(
+            &control_url,
+            "relay-a".into(),
+            temp.path().join("router.token"),
+        )
+        .unwrap();
+        async move { client.poll_once(&relay).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!blocked.is_finished());
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(300), ready(&next).send())
+            .await
+            .unwrap()
+            .unwrap()
+            .status(),
+        204
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok()
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(Ok(_)) = stream.next().await {}
+    })
+    .await
+    .unwrap();
+    assert!(
+        !blocked.is_finished(),
+        "writer lock must still hold the pending commit"
+    );
+    assert_eq!(ready(&next).send().await.unwrap().status(), 503);
+    // Losing the poll caller after a write starts cannot leave a durable
+    // revocation unpublished in memory or advertise it before commit.
+    blocked.abort();
+    let _ = blocked.await;
+    storage.execute_batch("COMMIT").unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let state: String = storage
+                .query_row("SELECT state FROM control", [], |r| r.get(0))
+                .unwrap();
+            if serde_json::from_str::<Value>(&state).unwrap()["revision"] == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    response.lock().unwrap()["from_revision"] = json!(2);
+    response.lock().unwrap()["revoked_routes"] = json!([]);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while client.poll_once(&relay).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        requests.lock().unwrap().last().unwrap()["applied_revision"],
+        2
+    );
+    assert!(start(&next).await.unwrap().is_err());
+    let mut third = next.clone();
+    third.execution.generation = 3;
+    third.execution.lease_id = "third".into();
+    let third_connector = start(&third);
+    for _ in 0..100 {
+        if ready(&third).send().await.unwrap().status() == 204 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut stream = http
+        .get(format!("http://{addr}/v1/http/{}/events", third.route_id()))
+        .header("x-trusted-access", signed(&third, Purpose::Access))
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream();
+    assert!(stream.next().await.unwrap().is_ok());
     control_task.abort();
     assert!(client.poll_once(&relay).await.is_err());
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -600,6 +705,7 @@ async fn managed_acceptance() {
     stop.cancel();
     connector.abort();
     next_connector.abort();
+    third_connector.abort();
     task.abort();
     app_task.abort();
 }
@@ -984,6 +1090,13 @@ async fn acceptance() {
             .status(),
         503
     );
+    let storage = rusqlite::Connection::open(&db).unwrap();
+    storage
+        .execute_batch(
+            "CREATE TRIGGER no_generation_refresh BEFORE INSERT ON generations
+        BEGIN SELECT RAISE(ABORT, 'same execution reconnect must not write'); END;",
+        )
+        .unwrap();
     let connector2 = tokio::spawn({
         let url = connector_url.clone();
         let token = register.clone();
@@ -1000,6 +1113,9 @@ async fn acceptance() {
             .status(),
         200
     );
+    storage
+        .execute_batch("DROP TRIGGER no_generation_refresh;")
+        .unwrap();
     let mut revoked_stream = http
         .get(format!("{base}/events"))
         .header("x-trusted-access", &access)
