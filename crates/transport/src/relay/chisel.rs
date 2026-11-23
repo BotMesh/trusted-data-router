@@ -189,13 +189,14 @@ pub(super) async fn attach(State(relay): State<Arc<Relay>>, mut req: Request) ->
 
 pub(super) async fn proxy<T: Send + 'static>(
     headers: HeaderMap,
-    response: Response,
+    mut response: Response,
     upgraded: hyper::upgrade::OnUpgrade,
     address: SocketAddr,
     cancel: CancellationToken,
     owner: T,
 ) -> HttpResult {
     let cancel_on_exit = cancel.clone().drop_guard();
+    let offered = headers.get("sec-websocket-protocol").cloned();
     let upstream = tokio::time::timeout(Duration::from_secs(10), async {
         let socket = TcpStream::connect(address)
             .await
@@ -227,12 +228,28 @@ pub(super) async fn proxy<T: Send + 'static>(
         if response.status() != StatusCode::SWITCHING_PROTOCOLS {
             return Err(StatusCode::BAD_GATEWAY);
         }
+        // Upstream Chisel only answers 101 to its exact protocol offer, but its
+        // upgrader never echoes the selection. Complete RFC 6455 negotiation
+        // at this edge with the offer the attach path already required, and
+        // reject any contradicting upstream selection.
+        if response
+            .headers()
+            .get("sec-websocket-protocol")
+            .is_some_and(|selected| Some(selected) != offered.as_ref())
+        {
+            return Err(StatusCode::BAD_GATEWAY);
+        }
         hyper::upgrade::on(&mut response)
             .await
             .map_err(|_| StatusCode::BAD_GATEWAY)
     })
     .await
     .map_err(|_| StatusCode::GATEWAY_TIMEOUT)??;
+    if let Some(offered) = offered {
+        response
+            .headers_mut()
+            .insert("sec-websocket-protocol", offered);
+    }
     tokio::spawn(async move {
         let _cancel_on_exit = cancel_on_exit;
         let _owner = owner;
