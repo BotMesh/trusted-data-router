@@ -57,15 +57,31 @@ pub struct SubjectRevocation {
     pub session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub application_only: Option<bool>,
+    /// Unix seconds after which a delegate (application-only) denial may be
+    /// dropped. Fleet sets it beyond the longest grant signed before the
+    /// denial, so dropping it cannot revive one. Operator bans never expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
 }
+/// Policies and permanent denials, as before expiry existed.
+pub const MAX_PERMANENT_RECORDS: usize = 1024;
+/// Expiring delegate denials, bounded separately so logouts never consume the
+/// permanent budget.
+pub const MAX_EXPIRING_REVOCATIONS: usize = 4096;
 impl SubjectRevocation {
-    /// Replacement must deny every identity and service denied by the old record.
-    /// In particular, application-only revocation cannot replace operator denial.
+    /// Replacement must deny every identity and service denied by the old record,
+    /// for at least as long. In particular, application-only revocation cannot
+    /// replace operator denial, and an expiring one cannot replace a permanent one.
     fn covers(&self, old: &Self) -> bool {
         self.namespace == old.namespace
             && self.principal == old.principal
             && (self.session.is_none() || self.session == old.session)
             && (self.application_only != Some(true) || old.application_only == Some(true))
+            && match (self.expires_at, old.expires_at) {
+                (None, _) => true,
+                (Some(new), Some(old)) => new >= old,
+                (Some(_), None) => false,
+            }
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,7 +104,25 @@ fn name(s: &str) -> bool {
 }
 impl AuthorizationState {
     pub fn validate(&self, previous: Option<&Self>) -> Result<()> {
-        if self.revision == 0 || self.policies.len() + self.revoked_subjects.len() > 1024 {
+        self.validate_at(previous, crate::grants::now())
+    }
+    /// `now` is this relay's own clock: an expiring denial may be absent only
+    /// once it has passed here, whatever Fleet's clock says.
+    pub fn validate_at(&self, previous: Option<&Self>, now: u64) -> Result<()> {
+        let expiring = self
+            .revoked_subjects
+            .iter()
+            .filter(|s| s.expires_at.is_some())
+            .count();
+        if self.revision == 0
+            || self.policies.len() + self.revoked_subjects.len() - expiring > MAX_PERMANENT_RECORDS
+            || expiring > MAX_EXPIRING_REVOCATIONS
+            // Only a namespace delegate's denial may expire.
+            || self.revoked_subjects.iter().any(|s| {
+                s.expires_at
+                    .is_some_and(|e| e == 0 || s.application_only != Some(true))
+            })
+        {
             return Err(Error::InvalidContract);
         }
         let mut policies = std::collections::HashSet::new();
@@ -121,10 +155,10 @@ impl AuthorizationState {
         if let Some(old) = previous {
             if self.revision < old.revision
                 || self.revision == old.revision && self != old
-                || old
-                    .revoked_subjects
-                    .iter()
-                    .any(|s| !self.revoked_subjects.iter().any(|new| new.covers(s)))
+                || old.revoked_subjects.iter().any(|s| {
+                    s.expires_at.is_none_or(|e| now < e)
+                        && !self.revoked_subjects.iter().any(|new| new.covers(s))
+                })
                 || old.policies.iter().any(|p| {
                     !self.policies.iter().any(|n| {
                         n.namespace == p.namespace

@@ -41,6 +41,7 @@ fn revocation_compaction_cannot_weaken_scope_or_reset_history() {
         principal: "12".repeat(32),
         session: Some("34".repeat(32)),
         application_only: Some(true),
+        expires_at: None,
     };
     let old = AuthorizationState {
         revision: 1,
@@ -88,6 +89,76 @@ fn revocation_compaction_cannot_weaken_scope_or_reset_history() {
     changed.revoked_subjects.clear();
     assert!(changed.validate(Some(&compacted)).is_err());
 }
+#[test]
+fn expiring_delegate_denials_leave_only_after_this_relays_clock_passes_them() {
+    use trusted_router_transport::authorization::{
+        AuthorizationState, SubjectRevocation, MAX_EXPIRING_REVOCATIONS, MAX_PERMANENT_RECORDS,
+    };
+    let now = 1_000_000;
+    let denial = |session: usize, expires_at: Option<u64>| SubjectRevocation {
+        namespace: "ab".repeat(16),
+        principal: "12".repeat(32),
+        session: Some(format!("{session:064x}")),
+        application_only: Some(true),
+        expires_at,
+    };
+    let state = |revision, revoked_subjects| AuthorizationState {
+        revision,
+        policies: vec![],
+        revoked_subjects,
+    };
+    let old = state(1, vec![denial(1, Some(now + 10)), denial(2, None)]);
+    old.validate_at(None, now).unwrap();
+    // Not before its time on this relay, and a permanent denial never.
+    let dropped = state(2, vec![denial(2, None)]);
+    assert!(dropped.validate_at(Some(&old), now + 9).is_err());
+    dropped.validate_at(Some(&old), now + 10).unwrap();
+    assert!(state(2, vec![denial(1, Some(now + 10))])
+        .validate_at(Some(&old), now + 1_000)
+        .is_err());
+    // Replacement must deny at least as long; expiry never replaces permanence.
+    let extended = state(2, vec![denial(1, Some(now + 20)), denial(2, None)]);
+    extended.validate_at(Some(&old), now).unwrap();
+    let shortened = state(2, vec![denial(1, Some(now + 5)), denial(2, None)]);
+    assert!(shortened.validate_at(Some(&old), now).is_err());
+    let mut principal = denial(1, Some(now + 20));
+    principal.session = None;
+    state(2, vec![principal.clone(), denial(2, None)])
+        .validate_at(Some(&old), now)
+        .unwrap();
+    assert!(state(2, vec![principal])
+        .validate_at(Some(&old), now)
+        .is_err());
+    // Only a namespace delegate's denial may expire.
+    for application_only in [None, Some(false)] {
+        let mut operator = denial(3, Some(now + 10));
+        operator.application_only = application_only;
+        assert!(state(1, vec![operator]).validate_at(None, now).is_err());
+    }
+    assert!(state(1, vec![denial(3, Some(0))])
+        .validate_at(None, now)
+        .is_err());
+    // Expiring denials have their own budget beside the permanent one.
+    let many: Vec<_> = (0..MAX_EXPIRING_REVOCATIONS)
+        .map(|i| denial(i, Some(now + 10)))
+        .chain((0..=MAX_PERMANENT_RECORDS).map(|i| {
+            let mut permanent = denial(i, None);
+            permanent.principal = "34".repeat(32);
+            permanent
+        }))
+        .collect();
+    let (fits, extra_permanent) = (&many[..many.len() - 1], many.last().unwrap());
+    state(1, fits.to_vec()).validate_at(None, now).unwrap();
+    for extra in [
+        denial(MAX_EXPIRING_REVOCATIONS, Some(now + 10)),
+        extra_permanent.clone(),
+    ] {
+        let mut over = fits.to_vec();
+        over.push(extra);
+        assert!(state(1, over).validate_at(None, now).is_err());
+    }
+}
+
 #[tokio::test]
 async fn session_user_and_policy_changes_cancel_only_matching_streams_without_restarting_connector()
 {

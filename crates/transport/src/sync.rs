@@ -340,7 +340,7 @@ impl ControlClient {
             // unchanged JSON request. New Fleet gates default policies on it.
             .header(
                 "x-fleet-router-capabilities",
-                "workload-defaults-v1,scoped-revocations-v1,revocation-compaction-v1",
+                "workload-defaults-v1,scoped-revocations-v1,revocation-compaction-v1,revocation-expiry-v1",
             )
             .json(&request)
             .send()
@@ -355,7 +355,8 @@ impl ControlClient {
         }
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| Error::Unavailable)? {
-            if body.len() + chunk.len() > 1024 * 1024 {
+            // A full snapshot: permanent records plus expiring delegate denials.
+            if body.len() + chunk.len() > 4 * 1024 * 1024 {
                 return Err(Error::InvalidContract);
             }
             body.extend_from_slice(&chunk);

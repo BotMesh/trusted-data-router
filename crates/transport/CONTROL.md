@@ -150,8 +150,23 @@ rollback. Never reset their database to work around that rejection.
 
 This recovers only redundant records. Distinct permanent bans still count toward
 the 64-record namespace budget and 1024-record router limit; route tombstones keep
-their separate 4096-record limit. Time-based expiry, general pagination and HA
-remain pending. Do not treat this compaction as unbounded migration capacity.
+their separate 4096-record limit. General pagination and HA remain pending. Do not
+treat this compaction as unbounded migration capacity.
+
+Relays also advertise `revocation-expiry-v1`. Fleet then gives each namespace
+delegate's (application-only) denial an `expires_at` beyond the longest grant
+signed before it: the one-hour grant lifetime plus clock margin. Every grant
+issued before the denial has therefore expired once it is dropped, and Fleet
+refuses new access bindings for the subject while it exists, so dropping it
+revives nothing. A delegate that later re-authorizes the same subject is making a
+new decision for its own namespace. The relay keeps denying until its own clock
+passes `expires_at` and rejects a snapshot that drops one earlier. A replacement
+must deny for at least as long, and expiry never replaces an operator ban, which
+stays permanent. Expiring denials have their own budget (4096 per relay), so
+logouts no longer consume the permanent one. Snapshots may be up to 4 MiB.
+Upgrade the relay before Fleet starts issuing expiring denials. A relay without
+this capability keeps receiving permanent denials. Relay and Fleet clocks must
+agree within the margin.
 
 Deploy the new Fleet, relay **and shim grant parser** before enabling identity
 mode in the backend. Older shims reject the additive access claim. Do not enable
