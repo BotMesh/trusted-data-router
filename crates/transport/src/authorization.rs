@@ -49,6 +49,13 @@ pub struct AccessPolicy {
     pub sha256: String,
     pub enabled: bool,
 }
+impl AccessPolicy {
+    fn same_target(&self, other: &Self) -> bool {
+        self.namespace == other.namespace
+            && self.workload == other.workload
+            && self.service == other.service
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubjectRevocation {
@@ -90,6 +97,11 @@ pub struct AuthorizationState {
     pub revision: u64,
     pub policies: Vec<AccessPolicy>,
     pub revoked_subjects: Vec<SubjectRevocation>,
+    /// The highest version of any policy Fleet has removed; it never decreases.
+    /// Fleet creates every later policy above it, so a grant bound to a removed
+    /// policy can never match one created afterwards for the same target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_policy_version: Option<u64>,
 }
 fn namespace(s: &str) -> bool {
     s.len() == 32
@@ -159,19 +171,27 @@ impl AuthorizationState {
                     s.expires_at.is_none_or(|e| now < e)
                         && !self.revoked_subjects.iter().any(|new| new.covers(s))
                 })
-                || old.policies.iter().any(|p| {
-                    !self.policies.iter().any(|n| {
-                        n.namespace == p.namespace
-                            && n.workload == p.workload
-                            && n.service == p.service
-                            && (n == p || n.version > p.version)
-                    })
+                || self.retired_policy_version < old.retired_policy_version
+                || old.policies.iter().any(|p| !self.succeeds(p))
+                || self.policies.iter().any(|n| {
+                    Some(n.version) <= old.retired_policy_version
+                        && !old.policies.iter().any(|p| p.same_target(n))
                 })
             {
                 return Err(Error::InvalidContract);
             }
         }
         Ok(())
+    }
+    /// Whether this snapshot accounts for the previous snapshot's policy `old`:
+    /// it keeps the policy, replaces it with a higher version, or retires it.
+    /// Only an enabled policy can be retired: a disabled exact policy is what
+    /// keeps its namespace's `*` default from applying to that workload.
+    fn succeeds(&self, old: &AccessPolicy) -> bool {
+        match self.policies.iter().find(|n| n.same_target(old)) {
+            Some(new) => new == old || new.version > old.version,
+            None => old.enabled && Some(old.version) <= self.retired_policy_version,
+        }
     }
     pub fn allows(&self, grant: &Grant) -> bool {
         let Some(binding) = &grant.access else {

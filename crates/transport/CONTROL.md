@@ -168,6 +168,21 @@ Upgrade the relay before Fleet starts issuing expiring denials. A relay without
 this capability keeps receiving permanent denials. Relay and Fleet clocks must
 agree within the margin.
 
+Relays also advertise `policy-retirement-v1`. Fleet may then remove the access
+policies of a workload that no longer exists, so they stop counting toward its
+namespace's budget. A snapshot carries `retired_policy_version`, the highest
+version of any removed policy, which never decreases. The relay accepts a
+previous policy's absence only when that policy was enabled, no policy for the
+same namespace, workload and service remains, and the floor covers its version.
+A policy the relay has not seen must arrive above the floor the relay holds.
+Grants bind a policy's version, and Fleet creates every later policy above the
+floor, so a grant bound to a removed policy never matches one created afterwards
+under the same name. A disabled policy is never removed this way: it is what
+keeps a namespace's `*` default from applying to that workload. A relay receives
+only the latest snapshot, so Fleet removes a policy only once the relay has
+applied the current revision. Upgrade the relay before Fleet, and do not
+downgrade it once a floor is stored: an older relay rejects the field.
+
 Deploy the new Fleet, relay **and shim grant parser** before enabling identity
 mode in the backend. Older shims reject the additive access claim. Do not enable
 it on a shared relay until all its clients support identities. Unconfigured

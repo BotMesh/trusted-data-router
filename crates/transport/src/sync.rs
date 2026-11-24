@@ -340,7 +340,7 @@ impl ControlClient {
             // unchanged JSON request. New Fleet gates default policies on it.
             .header(
                 "x-fleet-router-capabilities",
-                "workload-defaults-v1,scoped-revocations-v1,revocation-compaction-v1,revocation-expiry-v1",
+                "workload-defaults-v1,scoped-revocations-v1,revocation-compaction-v1,revocation-expiry-v1,policy-retirement-v1",
             )
             .json(&request)
             .send()

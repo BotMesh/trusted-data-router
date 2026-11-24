@@ -47,6 +47,7 @@ fn revocation_compaction_cannot_weaken_scope_or_reset_history() {
         revision: 1,
         policies: vec![],
         revoked_subjects: vec![session.clone()],
+        retired_policy_version: None,
     };
     let mut user = session.clone();
     user.session = None;
@@ -106,6 +107,7 @@ fn expiring_delegate_denials_leave_only_after_this_relays_clock_passes_them() {
         revision,
         policies: vec![],
         revoked_subjects,
+        retired_policy_version: None,
     };
     let old = state(1, vec![denial(1, Some(now + 10)), denial(2, None)]);
     old.validate_at(None, now).unwrap();
@@ -157,6 +159,82 @@ fn expiring_delegate_denials_leave_only_after_this_relays_clock_passes_them() {
         over.push(extra);
         assert!(state(1, over).validate_at(None, now).is_err());
     }
+}
+#[test]
+fn a_policy_leaves_only_when_enabled_and_covered_by_a_floor_that_never_decreases() {
+    use trusted_router_transport::authorization::{AccessPolicy, AuthorizationState};
+    let policy = |workload: &str, version, enabled| AccessPolicy {
+        namespace: "ab".repeat(16),
+        workload: workload.into(),
+        service: "control".into(),
+        version,
+        sha256: "cd".repeat(32),
+        enabled,
+    };
+    let state = |revision, policies, retired_policy_version| AuthorizationState {
+        revision,
+        policies,
+        revoked_subjects: vec![],
+        retired_policy_version,
+    };
+    let rejects =
+        |new: &AuthorizationState, old: &AuthorizationState| new.validate(Some(old)).is_err();
+    let old = state(
+        1,
+        vec![policy("agent", 3, true), policy("other", 1, true)],
+        None,
+    );
+    let kept = vec![policy("other", 1, true)];
+    // A removal needs a floor at or above the removed version.
+    assert!(rejects(&state(2, kept.clone(), None), &old));
+    assert!(rejects(&state(2, kept.clone(), Some(2)), &old));
+    let retired = state(2, kept.clone(), Some(3));
+    retired.validate(Some(&old)).unwrap();
+    // A floor above a policy that stays leaves that policy valid.
+    state(2, old.policies.clone(), Some(9))
+        .validate(Some(&old))
+        .unwrap();
+    // Without a floor a snapshot serializes as it always did.
+    assert!(serde_json::to_value(&old)
+        .unwrap()
+        .get("retired_policy_version")
+        .is_none());
+    assert_eq!(
+        serde_json::to_value(&retired).unwrap()["retired_policy_version"],
+        3
+    );
+    // The floor never decreases.
+    assert!(rejects(&state(3, kept.clone(), Some(2)), &retired));
+    assert!(rejects(&state(3, kept.clone(), None), &retired));
+    // A policy this relay has not seen must be above the floor it holds, whatever its name.
+    for (workload, version, accepted) in [
+        ("agent", 3, false),
+        ("agent", 4, true),
+        ("new", 3, false),
+        ("new", 4, true),
+    ] {
+        let mut policies = kept.clone();
+        policies.push(policy(workload, version, true));
+        assert_eq!(
+            state(3, policies, Some(3)).validate(Some(&retired)).is_ok(),
+            accepted,
+            "{workload} v{version}"
+        );
+    }
+    // A relay that missed the retirement sees the policy created again as a higher version.
+    let recreated = state(
+        3,
+        vec![policy("agent", 4, true), policy("other", 1, true)],
+        Some(3),
+    );
+    recreated.validate(Some(&old)).unwrap();
+    // A disabled policy blocks its namespace's default, so no floor removes it. A relay
+    // that missed its enabling rejects the removal until the policy is back, higher.
+    let denied = state(1, vec![policy("agent", 3, false)], None);
+    assert!(rejects(&state(3, vec![], Some(4)), &denied));
+    state(4, vec![policy("agent", 5, true)], Some(4))
+        .validate(Some(&denied))
+        .unwrap();
 }
 
 #[tokio::test]
